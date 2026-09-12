@@ -504,9 +504,31 @@ function restore(id) {
 // 解析済みの拍データ(<BEATS_DIR>/<id>.json)があれば読む。公開版は同梱した分だけ
 const BEATS_DIR = 'beats';
 const IS_LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+// 公開ページでも、このPCで 起動.bat(解析サーバー)が動いていれば自動解析を使う
+const LOCAL_API = 'http://127.0.0.1:8765';
+let apiBase = IS_LOCAL ? '' : null;   // '' = 同じサーバー、null = 解析不可
+async function detectLocalServer() {
+  if (IS_LOCAL) return true;
+  try {
+    const r = await fetch(LOCAL_API + '/ping', { cache: 'no-store', signal: AbortSignal.timeout(1500) });
+    if (r.ok) { apiBase = LOCAL_API; return true; }
+  } catch (e) {}
+  return false;
+}
+function renderAnalyzeUI() {
+  const can = apiBase !== null;
+  $('analyze').style.display = can ? '' : 'none';
+  $('analyzeHint').style.display = can ? '' : 'none';
+  $('noAnalyze').style.display = can ? 'none' : '';
+}
 async function fetchBeats(id) {
   try {
-    const r = await fetch(BEATS_DIR + '/' + id + '.json', { cache: 'no-store' });
+    let r = null;
+    if (apiBase === LOCAL_API) {                       // 公開ページ+このPCのサーバー: まず手元の解析結果
+      try { r = await fetch(LOCAL_API + '/' + encodeURIComponent(BEATS_DIR) + '/' + id + '.json', { cache: 'no-store' }); } catch (e) { r = null; }
+      if (r && !r.ok) r = null;
+    }
+    if (!r) r = await fetch(BEATS_DIR + '/' + id + '.json', { cache: 'no-store' });
     if (!r.ok) return false;
     const d = await r.json();
     if (hasBeats() && d.generated && d.generated === S.generated) return true;   // 保存済みと同じ解析結果
@@ -520,7 +542,8 @@ async function analyzeNow() {
   const btn = $('analyze'); btn.disabled = true; btn.textContent = '解析中(20〜60秒)…';
   setStatus('音声を落として拍を検出しています…');
   try {
-    const r = await fetch('/analyze?id=' + S.videoId, { cache: 'no-store' });
+    if (apiBase === null) throw new Error('解析サーバーが見つかりません');
+    const r = await fetch(apiBase + '/analyze?id=' + S.videoId, { cache: 'no-store' });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.status);
     applyBeats(d);
@@ -639,7 +662,8 @@ document.addEventListener('keydown', e => {
 document.addEventListener('pointerdown', () => ensureAudio(), { once: true });
 
 renderBeats(); renderAB();
-if (!IS_LOCAL) { $('analyze').style.display = 'none'; $('analyzeHint').style.display = 'none'; $('noAnalyze').style.display = ''; }
+renderAnalyzeUI();
+detectLocalServer().then(() => { renderAnalyzeUI(); if (S.videoId) fetchBeats(S.videoId); });
 try { const last = localStorage.getItem('ytm:last'); if (last) $('url').value = 'https://www.youtube.com/watch?v=' + last; } catch (e) {}
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>
