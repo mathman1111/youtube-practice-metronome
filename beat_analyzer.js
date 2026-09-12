@@ -352,7 +352,7 @@
     }
 
     // 5. 拍の強さ(1拍目推定用): 拍直後 50ms のエネルギー増加(全帯域 + 200Hz以下)と、拍ごとの和音の変化
-    const rmsLow = rmsEnvelope(lowpass(y, sr, 200), 256, hopE);
+    const rmsLow = rmsEnvelope(lowpass(y, sr, 110), 256, hopE);   // 110Hz 以下 = ほぼキック(200Hz だとベースが混ざって拍の区別が付かなかった)
     const denvLow = new Float32Array(rmsLow.length);
     for (let i = 1; i < rmsLow.length; i++) denvLow[i] = Math.max(0, rmsLow[i] - rmsLow[i - 1]);
     const riseAt = (env, t) => { const f0 = Math.max(0, Math.round((t - 0.01) * fpsE)), f1 = Math.min(env.length - 1, Math.round((t + 0.05) * fpsE)); let m = 0; for (let f = f0; f <= f1; f++) m = Math.max(m, env[f]); return m; };
@@ -369,7 +369,12 @@
     });
     const oChg = beats.map((_, i) => { if (!i) return 0; let d = 0; for (let c = 0; c < 12; c++) d += beatChroma[i][c] * beatChroma[i - 1][c]; return Math.max(0, 1 - d); });
     const mA = Math.max(...oAll, 1e-9), mL = Math.max(...oLow, 1e-9), mC = Math.max(...oChg, 1e-9);
-    const strength = beats.map((_, i) => Math.round((0.35 * oAll[i] / mA + 0.25 * oLow[i] / mL + 0.4 * oChg[i] / mC) * 1e4) / 1e4);
+    // 小節幅のクロマ新規性: 拍 i の前4拍と後4拍の和音の違い(コードは小節頭で変わることが多い)
+    const winChroma = (i0, i1) => { const v = new Float32Array(12); for (let i = Math.max(0, i0); i < Math.min(beats.length, i1); i++) for (let c = 0; c < 12; c++) v[c] += beatChroma[i][c]; let n = 0; for (let c = 0; c < 12; c++) n += v[c] * v[c]; n = Math.sqrt(n) || 1; for (let c = 0; c < 12; c++) v[c] /= n; return v; };
+    const oNov = beats.map((_, i) => { if (i < 4 || i + 4 > beats.length) return 0; const a = winChroma(i - 4, i), b = winChroma(i, i + 4); let d = 0; for (let c = 0; c < 12; c++) d += a[c] * b[c]; return Math.max(0, 1 - d); });
+    const mN = Math.max(...oNov, 1e-9);
+    const strength = beats.map((_, i) => Math.round((0.3 * oAll[i] / mA + 0.2 * oLow[i] / mL + 0.2 * oChg[i] / mC + 0.3 * oNov[i] / mN) * 1e4) / 1e4);
+    const features = opts.features ? { rise: oAll.map(v => v / mA), low: oLow.map(v => v / mL), chg: oChg.map(v => v / mC), nov: oNov.map(v => v / mN) } : undefined;
 
     return {
       tempo: Math.round(g.top.bpm * 100) / 100,
@@ -381,6 +386,7 @@
       duration: Math.round(T * 100) / 100,
       phaseBiasMs: Math.round(biasSum / segments.length * 1000),
       candidates: g.results.map(r => Math.round(r.bpm * 100) / 100),
+      features,
     };
   }
 

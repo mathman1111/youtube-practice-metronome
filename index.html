@@ -676,6 +676,16 @@ async function captureAndAnalyze() {
     await new Promise(r => setTimeout(r, 50));
     const res = await analyzeCaptured(cap, csr, beepAt);
     res.source = 'capture';
+    // ローカル版(解析サーバーあり)なら、原因調査用に生データを保存する: 位置合わせの組・拍・録った音声
+    if (apiBase !== null && window.__lastCapture) {
+      try {
+        const L = window.__lastCapture, stamp = nowStamp().replace(/[: ]/g, '-');
+        const meta = { videoId: S.videoId, firstPlaybackTime: L.firstPlaybackTime, beepAt: L.beepAt, delay: L.delay, found: L.found, ctxToVideo: L.ctxToVideo,
+          csr: L.csr, sr: L.sr, waLat: (audio.baseLatency || 0) + (audio.outputLatency || 0), pairs: L.pairs, res: L.res, beatsVideo: res.beats, logs: L.logs, lostSec: L.lostSec, duration: player.getDuration() };
+        fetch(apiBase + '/debug/' + S.videoId + '_' + stamp + '.json', { method: 'POST', body: JSON.stringify(meta) }).catch(() => {});
+        fetch(apiBase + '/debug/' + S.videoId + '_' + stamp + '.f32', { method: 'POST', body: L.y.buffer }).catch(() => {});
+      } catch (e) {}
+    }
     // 同じ動画の音声ファイル基準の拍があれば、その差 = プレーヤーの報告位置と実際の音の遅れ。全曲の同梱データに適用する
     let calib = '';
     const fileBeats = (S.source === 'file' && hasBeats()) ? S.beats : null;
