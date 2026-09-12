@@ -187,12 +187,19 @@
         const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / priorCenter) / priorWidth, 2));
         results.push({ score: contrast * prior * acAt(ac, bpm), contrast, bpm, off });
       }
+      // 付点(1.5倍・2.5倍…)の周期のピークが他にあるなら、その候補が本当の拍で、他は拍の上の強弱パターン。
+      // 空奏列車(175BPM)で 2/3 の 116.6 が「コントラスト」で勝っていたので、半整数比で説明できる候補を強く優先する
+      for (const r of results) {
+        let ev = 0;
+        for (const o of results) { const ratio = (60 / o.bpm) / (60 / r.bpm); if (ratio > 1.2 && Math.abs(ratio - Math.round(ratio - 0.5) - 0.5) < 0.04) ev++; }
+        r.evidence = ev; r.score *= 1 + 2 * ev;
+      }
       results.sort((x, y) => y.score - x.score);
       let top = results[0];
       for (const r of results.slice(1)) {
         const ratio = r.bpm / top.bpm;
-        if (Math.abs(ratio - 2) < 0.06 && r.contrast >= top.contrast * 0.8) top = r;
-        else if (Math.abs(ratio - 0.5) < 0.015 && top.contrast < r.contrast * 0.8) top = r;
+        if (Math.abs(ratio - 2) < 0.06 && (r.contrast >= top.contrast * 0.8 || r.evidence > top.evidence)) top = r;
+        else if (Math.abs(ratio - 0.5) < 0.015 && top.contrast < r.contrast * 0.8 && !(top.evidence > r.evidence)) top = r;
       }
       return { top, results };
     }
@@ -203,7 +210,7 @@
     for (const c of cands.slice(0, 4)) { add(c * 2); add(c / 2); }
     if (!cands.length) cands.push(120);
     const g = chooseTempo(cands, 0, T, acG, 120, 0.8, 0.03);
-    for (const r of g.results) log(`候補 ${r.bpm.toFixed(2)} BPM コントラスト ${r.contrast.toFixed(2)} 評価 ${r.score.toFixed(3)}`);
+    for (const r of g.results) log(`候補 ${r.bpm.toFixed(2)} BPM コントラスト ${r.contrast.toFixed(2)} 付点の根拠 ${r.evidence} 評価 ${r.score.toFixed(3)}`);
     const gBpm = g.top.bpm;
 
     // 2. 途中でテンポが変わる曲: 12秒窓(4秒刻み)ごとの局所テンポを測り、2%以上違う区間に分ける
