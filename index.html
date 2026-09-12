@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YouTube同期メトロノーム</title>
+<style>
+  :root{
+    --bg:#14161a; --panel:#1e2128; --line:#2c3038; --fg:#e8e8ec; --dim:#9a9fa8;
+    --acc:#3ddc84; --acc2:#ffb454; --danger:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,"Segoe UI","Noto Sans JP",sans-serif;font-size:15px}
+  header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .hint{color:var(--dim);font-size:13px}
+  main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;padding:16px;max-width:1280px;margin:0 auto}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .panel h2{font-size:13px;color:var(--dim);margin:0 0 10px;font-weight:600;letter-spacing:.04em}
+  .url{display:flex;gap:8px}
+  .url input{flex:1}
+  input[type=text],input[type=number]{background:#0f1114;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:8px 10px;font-size:15px;width:100%}
+  input[type=number]{width:96px;text-align:right}
+  button{background:#2a2e37;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-size:14px;cursor:pointer}
+  button:hover{background:#343945}
+  button.primary{background:var(--acc);color:#0c1a10;border-color:var(--acc);font-weight:600}
+  button.primary:hover{background:#5ae79a}
+  button.small{padding:4px 8px;font-size:12px}
+  button.on{border-color:var(--acc);color:var(--acc)}
+  .player{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden;margin-top:12px}
+  .player iframe,.player #yt{position:absolute;inset:0;width:100%;height:100%}
+  .beats{display:flex;justify-content:center;gap:18px;padding:22px 0 10px}
+  .beat{width:56px;height:56px;border-radius:50%;background:#2a2e37;border:2px solid var(--line);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--dim);transition:transform .06s}
+  .beat.lit{background:var(--acc);border-color:var(--acc);color:#0c1a10;transform:scale(1.12);box-shadow:0 0 18px rgba(61,220,132,.5)}
+  .beat.lit.first{background:var(--acc2);border-color:var(--acc2);box-shadow:0 0 18px rgba(255,180,84,.55)}
+  .pos{text-align:center;color:var(--dim);font-variant-numeric:tabular-nums;font-size:14px}
+  .pos b{color:var(--fg);font-size:22px;margin:0 6px}
+  .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+  .row label{color:var(--dim);font-size:13px;min-width:74px}
+  .sep{height:1px;background:var(--line);margin:12px 0}
+  .kbd{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px;color:var(--dim);margin-left:4px}
+  .status{font-size:12px;color:var(--dim);margin-top:8px;min-height:1.4em}
+  .status.err{color:var(--danger)}
+  .ab{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .ab .t{font-variant-numeric:tabular-nums;color:var(--acc2);min-width:58px;display:inline-block}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--dim);font-size:13px}
+  details p{font-size:13px;color:var(--dim);line-height:1.7;margin:8px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>YouTube同期メトロノーム</h1>
+  <span class="hint">拍の丸は動画の再生位置から計算するので、止めても・巻き戻しても・速度を変えてもずれません。</span>
+</header>
+<main>
+  <section>
+    <div class="panel">
+      <h2>動画</h2>
+      <div class="url">
+        <input id="url" type="text" placeholder="YouTubeのURL か 動画ID を貼って Enter">
+        <button id="load" class="primary">読み込む</button>
+      </div>
+      <div class="player"><div id="yt"></div></div>
+      <div class="status" id="status">URLを貼ってください。</div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <div class="beats" id="beats"></div>
+      <div class="pos"><span>小節</span><b id="bar">-</b><span>拍</span><b id="beat">-</b><span id="time">0:00.0</span></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>自動で合わせる</h2>
+      <div class="row">
+        <button id="analyze" class="primary">音声を解析して拍を出す</button>
+        <span id="noAnalyze" style="display:none;color:var(--dim);font-size:12px">この公開版では自動解析は使えません(解析済みの曲だけ自動で合います)。他の曲は「1拍目の位置」の D → E で合わせてください</span>
+      </div>
+      <div class="row"><span id="beatMode" style="color:var(--dim);font-size:12px">拍: 手動(BPM×オフセット)</span></div>
+      <div class="row" id="beatOps" style="display:none">
+        <button class="small" id="half">拍を半分に(÷2)</button>
+        <button class="small" id="double">拍を倍に(×2)</button>
+        <button class="small" id="manual">手動に戻す</button>
+      </div>
+      <div class="row"><span style="color:var(--dim);font-size:12px">動画の音声を落として拍を検出する(20〜60秒)。1拍目の位置は自動推定。違っていたら曲の1拍目で D を押すと直る</span></div>
+      <div class="sep"></div>
+
+      <h2>テンポ</h2>
+      <div class="row">
+        <label>BPM</label>
+        <input id="bpm" type="number" min="20" max="400" step="0.01" value="120">
+        <button id="tap">タップ<span class="kbd">T</span></button>
+      </div>
+      <div class="row">
+        <label>拍子</label>
+        <button class="small bpb" data-n="2">2</button>
+        <button class="small bpb" data-n="3">3</button>
+        <button class="small bpb on" data-n="4">4</button>
+        <button class="small bpb" data-n="6">6</button>
+      </div>
+      <div class="sep"></div>
+
+      <h2>1拍目の位置</h2>
+      <div class="row">
+        <button id="down" class="primary">今の位置を1拍目にする<span class="kbd">D</span></button>
+      </div>
+      <div class="row">
+        <button id="down2">後ろの1拍目でBPM補正<span class="kbd">E</span></button>
+      </div>
+      <div class="row"><span style="color:var(--dim);font-size:12px">D のあと、曲の後半(1分以上先)の1拍目で E。間の拍数からBPMを小数まで直すので、長く聴いてもずれない</span></div>
+      <div class="row">
+        <label>オフセット</label>
+        <input id="offset" type="number" step="0.01" value="0"><span style="color:var(--dim)">秒</span>
+      </div>
+      <div class="row">
+        <label>微調整</label>
+        <span id="shiftV" style="color:var(--dim);font-size:12px;min-width:52px"></span>
+        <button class="small nudge" data-ms="-50">-50ms</button>
+        <button class="small nudge" data-ms="-10">-10</button>
+        <button class="small nudge" data-ms="10">+10</button>
+        <button class="small nudge" data-ms="50">+50ms</button>
+      </div>
+      <div class="row"><span style="color:var(--dim);font-size:12px">再生しながら <b>←</b> <b>→</b> で10ms(Shiftで50ms)ずつ。クリックが曲より早ければ →、遅ければ ←</span></div>
+      <div class="sep"></div>
+
+      <h2>クリック音</h2>
+      <div class="row">
+        <button id="click" class="on">鳴らす<span class="kbd">M</span></button>
+        <label style="min-width:auto">音量</label>
+        <input id="vol" type="range" min="0" max="1" step="0.05" value="0.6" style="width:110px">
+      </div>
+      <div class="row">
+        <label>遅延補正</label>
+        <input id="lat" type="number" step="5" value="0"><span style="color:var(--dim)">ms(Bluetoothなら100前後)</span>
+      </div>
+      <div class="sep"></div>
+
+      <h2>再生速度</h2>
+      <div class="row" id="rates">
+        <button class="small rate" data-r="0.5">0.5</button>
+        <button class="small rate" data-r="0.75">0.75</button>
+        <button class="small rate on" data-r="1">1.0</button>
+        <button class="small rate" data-r="1.25">1.25</button>
+      </div>
+      <div class="sep"></div>
+
+      <h2>区間ループ(同じところを何回も)</h2>
+      <div class="row">
+        <button id="loopFrom">この小節から<span class="kbd">[</span></button>
+        <button id="loopTo">この小節まで<span class="kbd">]</span></button>
+      </div>
+      <div class="ab">
+        <span class="t" id="loopRange" style="min-width:auto">--</span>
+      </div>
+      <div class="ab">
+        <label style="min-width:auto">始点</label><button class="small" id="fromM">-1</button><button class="small" id="fromP">+1</button>
+        <label style="min-width:auto;margin-left:6px">終点</label><button class="small" id="toM">-1</button><button class="small" id="toP">+1</button>
+      </div>
+      <div class="row">
+        <button id="loopOn">ループ<span class="kbd">L</span></button>
+        <button class="small" id="loopRestart">頭から<span class="kbd">R</span></button>
+        <button class="small" id="loopClear">解除</button>
+        <span class="t" id="loopCount" style="min-width:auto"></span>
+      </div>
+      <div class="row"><label style="min-width:auto"><input type="checkbox" id="preroll"> 1小節前から入る</label></div>
+      <div class="row"><label style="min-width:auto"><input type="checkbox" id="ramp"> <input id="rampN" type="number" min="1" max="20" value="3" style="width:56px"> 回ごとに速度 +0.25(1.0まで)</label></div>
+      <details>
+        <summary>使い方</summary>
+        <p>1. URLを貼って読み込む。 2. 動画を再生し、曲の1拍目が鳴った瞬間に <b>D</b> を押す。 3. BPMが分からなければ <b>T</b> を拍に合わせて4回以上叩く。 4. 曲の後半の1拍目で <b>E</b> を押すとBPMが正確な小数に補正され、後ろまでずれない。 5. 頭だけずれるなら微調整ボタンでオフセットを動かす。</p>
+        <p>同じところを練習: 練習したい小節で <b>[</b>(始点)、終わりの小節で <b>]</b>(終点)、<b>L</b> でループ開始。小節の頭にぴったり吸着する。速度を落として「N回ごとに+0.25」を入れると、できたら自動で速くなる。</p>
+        <p>設定(BPM・拍子・オフセット・ループ範囲)は動画ごとにこのブラウザに保存されます。</p>
+      </details>
+    </div>
+  </aside>
+</main>
+
+<script>
+// ---------- 状態 ----------
+const S = {
+  bpm: 120, bpb: 4, offset: 0, latencyMs: 0, click: true, vol: 0.6, rate: 1,
+  A: null, B: null, videoId: null,
+  loop: { on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 },   // 小節番号(1始まり、to は含む)
+  beats: null, strength: null, phase: 0, phaseManual: false, generated: null,
+  shift: 0,   // 解析した拍を全体でずらす秒数(← → キー)   // 解析した拍(あれば BPM×オフセットより優先)
+};
+let player = null, ready = false, playing = false;
+let loopCount = 0;            // 今の範囲を何回通ったか
+let seekLockUntil = 0;        // ループで戻した直後、プレーヤーが古い時刻を返す間は推定を信じる(performance.now 基準)
+let seekTarget = 0;
+// 動画時刻の推定用アンカー(getCurrentTimeは更新が粗いので、間を自前で補間する)
+let anchorVideo = 0, anchorPerf = 0;
+let audio = null, gain = null;
+let lastScheduled = null;   // 直近に音を予約した拍の番号
+const LOOKAHEAD = 0.12;      // 秒。この先まで音を予約する
+const taps = [];
+
+const $ = (id) => document.getElementById(id);
+const beatsEl = $('beats');
+
+// ---------- 動画時刻 ----------
+function videoTime() {
+  if (!ready) return 0;
+  if (!playing) return player.getCurrentTime() || 0;
+  return anchorVideo + (performance.now() - anchorPerf) / 1000 * S.rate;
+}
+function reanchor() {
+  anchorVideo = player.getCurrentTime() || 0;
+  anchorPerf = performance.now();
+  lastScheduled = null;
+}
+function beatDur() { return 60 / S.bpm; }
+function hasBeats() { return !!(S.beats && S.beats.length); }
+// k番目の拍の動画時刻。解析モードで最後の拍を過ぎたら null
+function beatTime(k) {
+  if (!hasBeats()) return S.offset + k * beatDur();
+  return k < S.beats.length ? S.beats[k] + S.shift : null;
+}
+// 時刻 t が何拍目か(直前の拍の番号。最初の拍より前なら -1)
+function beatIndex(t) {
+  if (!hasBeats()) return Math.floor((t - S.offset) / beatDur() + 1e-6);
+  let lo = 0, hi = S.beats.length - 1, r = -1;
+  t -= S.shift;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (S.beats[m] <= t + 1e-6) { r = m; lo = m + 1; } else hi = m - 1; }
+  return r;
+}
+function isDownbeat(k) { return mod(k - (hasBeats() ? S.phase : 0), S.bpb) === 0; }
+function barBeat(k) { const kk = k - (hasBeats() ? S.phase : 0); return { bar: Math.floor(kk / S.bpb) + 1, b: mod(kk, S.bpb) }; }
+// 拍ごとの強さから1拍目の位置(位相)を推定する
+function autoPhase() {
+  if (!hasBeats() || !S.strength || S.phaseManual) return;
+  let best = 0, bestV = -1;
+  for (let ph = 0; ph < S.bpb; ph++) {
+    let v = 0;
+    for (let i = ph; i < S.strength.length; i += S.bpb) v += S.strength[i];
+    if (v > bestV) { bestV = v; best = ph; }
+  }
+  S.phase = best;
+}
+function applyBeats(data, keepPhase) {
+  S.beats = data.beats; S.strength = data.strength || null; S.generated = data.generated || null;
+  if (!keepPhase) { S.phaseManual = false; autoPhase(); }
+  if (data.tempo) { S.bpm = data.tempo; $('bpm').value = S.bpm; }
+  lastScheduled = null; lastLit = -1; save(); renderMode();
+}
+function renderMode() {
+  const has = hasBeats();
+  $('beatMode').textContent = has
+    ? '拍: 解析済み(' + S.bpm + ' BPM・' + S.beats.length + '拍・1拍目は' + (S.phaseManual ? 'Dで指定' : '自動推定') + ')'
+    : '拍: 手動(BPM×オフセット)';
+  $('beatOps').style.display = has ? '' : 'none';
+  renderShift();
+}
+
+// ---------- YouTube ----------
+function parseId(s) {
+  s = s.trim();
+  const m = s.match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
+  if (m) return m[1];
+  if (/^[\w-]{11}$/.test(s)) return s;
+  return null;
+}
+function loadVideo() {
+  const id = parseId($('url').value);
+  if (!id) { setStatus('URLから動画IDが読めませんでした。', true); return; }
+  S.videoId = id;
+  restore(id); fetchBeats(id);   // 保存済みがあっても、サーバーに新しい解析結果があればそちらを使う
+  renderMode();
+  if (player && ready) { player.loadVideoById(id); return; }
+  createPlayer(id);
+}
+function createPlayer(id) {
+  player = new YT.Player('yt', {
+    videoId: id,
+    playerVars: { rel: 0, modestbranding: 1, playsinline: 1, ...(location.protocol.startsWith('http') ? { origin: location.origin } : {}) },
+    events: {
+      onReady: () => {
+        ready = true;
+        player.setPlaybackRate(S.rate);
+        setStatus('読み込みました。再生して、1拍目で D を押してください。');
+        startLoops();
+      },
+      onStateChange: (e) => {
+        const st = e.data;
+        if (st === YT.PlayerState.PLAYING) {
+          playing = true; reanchor();
+          if (audio && audio.state === 'suspended') audio.resume();
+        } else {
+          playing = false; lastScheduled = null;
+        }
+      },
+      onPlaybackRateChange: (e) => { S.rate = e.data; reanchor(); markRate(); },
+      onError: (e) => {
+        if (e.data === 153 && location.protocol === 'file:') {
+          setStatus('コード153: ダブルクリック(file://)で開くとYouTubeが弾きます。同じフォルダの「起動.bat」から開いてください。', true);
+        } else {
+          setStatus('この動画は埋め込み再生できません(コード ' + e.data + ')。', true);
+        }
+      },
+    },
+  });
+}
+window.onYouTubeIframeAPIReady = () => { setStatus('URLを貼ってください。'); };
+
+// ---------- 音 ----------
+function ensureAudio() {
+  if (audio) return;
+  audio = new (window.AudioContext || window.webkitAudioContext)();
+  gain = audio.createGain(); gain.gain.value = S.vol; gain.connect(audio.destination);
+}
+function scheduleClick(atAudioTime, accent) {
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = accent ? 1600 : 1000;
+  g.gain.setValueAtTime(0.0001, atAudioTime);
+  g.gain.exponentialRampToValueAtTime(1, atAudioTime + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, atAudioTime + 0.05);
+  o.connect(g); g.connect(gain);
+  o.start(atAudioTime); o.stop(atAudioTime + 0.06);
+}
+// 25msごとに、この先LOOKAHEAD秒以内に来る拍の音を予約する
+function scheduler() {
+  if (!ready || !playing || !S.click || !audio) return;
+  const now = videoTime();
+  let k = lastScheduled === null ? beatIndex(now) + 1 : lastScheduled + 1;
+  // 直前の拍が予約漏れなら飛ばす(シーク直後など)
+  if (lastScheduled !== null && k < beatIndex(now)) k = beatIndex(now) + 1;
+  for (;;) {
+    const tVideo = beatTime(k);
+    if (tVideo === null) break;                   // 解析した最後の拍を過ぎた
+    const dt = (tVideo - now) / S.rate;          // 実時間での残り秒
+    if (dt > LOOKAHEAD) break;
+    if (k >= 0 && dt > -0.02) {                   // 1拍目より前(曲が始まる前)と、もう過ぎた拍は鳴らさない
+      const outLat = audio.outputLatency || audio.baseLatency || 0;   // ブラウザが報告する音の出力遅延
+      const at = audio.currentTime + Math.max(0, dt - S.latencyMs / 1000 - outLat);
+      scheduleClick(at, isDownbeat(k));
+    }
+    lastScheduled = k; k++;
+  }
+}
+function mod(a, n) { return ((a % n) + n) % n; }
+
+// ---------- 小節とループ ----------
+function barStartBeat(bar) { return (hasBeats() ? S.phase : 0) + (bar - 1) * S.bpb; }
+// bar小節(1始まり)の頭の動画時刻。解析した最後の拍を越える場合は最後の拍から等間隔で延長
+function barStartTime(bar) {
+  const k = barStartBeat(bar);
+  if (k < 0) return Math.max(0, beatTime(0) + k * beatDur());
+  const t = beatTime(k);
+  if (t !== null) return t;
+  const n = S.beats.length;
+  return S.beats[n - 1] + S.shift + (k - (n - 1)) * beatDur();
+}
+function currentBar(t) { const k = beatIndex(t); return k < 0 ? 1 : Math.max(1, barBeat(k).bar); }
+// ループの実際の区間 [A, B)。B は終点小節の次の小節頭
+function loopSpan() {
+  const L = S.loop;
+  if (L.from === null || L.to === null || L.to < L.from) return null;
+  const A = barStartTime(L.preroll ? Math.max(1, L.from - 1) : L.from);
+  const B = barStartTime(L.to + 1);
+  return { A, B };
+}
+function setLoopFrom() {
+  if (!ready) return;
+  S.loop.from = currentBar(videoTime());
+  if (S.loop.to === null || S.loop.to < S.loop.from) S.loop.to = S.loop.from;
+  loopCount = 0; renderLoop(); save();
+}
+function setLoopTo() {
+  if (!ready) return;
+  S.loop.to = currentBar(videoTime());
+  if (S.loop.from === null || S.loop.from > S.loop.to) S.loop.from = S.loop.to;
+  loopCount = 0; renderLoop(); save();
+}
+function moveLoop(which, d) {
+  const L = S.loop; if (L.from === null) return;
+  if (which === 'from') L.from = Math.max(1, L.from + d); else L.to = Math.max(1, L.to + d);
+  if (L.to < L.from) { if (which === 'from') L.to = L.from; else L.from = L.to; }
+  loopCount = 0; renderLoop(); save();
+}
+function toggleLoop(on) {
+  const L = S.loop;
+  L.on = on === undefined ? !L.on : on;
+  if (L.on && !loopSpan()) { L.on = false; setStatus('先に [ と ] で小節の範囲を決めてください。', true); }
+  loopCount = 0; renderLoop(); save();
+  if (L.on) restartLoop();
+}
+// 区間の頭へ戻す。プレーヤーはシーク直後しばらく古い時刻を返すので、その間は戻し先を正として扱う
+function seekVideo(t) {
+  if (!ready) return;
+  player.seekTo(t, true);
+  anchorVideo = t; anchorPerf = performance.now(); lastScheduled = null; lastLit = -1;
+  seekTarget = t; seekLockUntil = performance.now() + 1500;
+}
+function restartLoop() {
+  const sp = loopSpan(); if (!sp) return;
+  seekVideo(sp.A);
+  if (playing === false && ready) player.playVideo();
+}
+// 終点に着いたときの処理。回数を数え、必要なら速度を上げ、頭へ戻す
+function onLoopEnd() {
+  const L = S.loop;
+  loopCount++;
+  if (L.ramp && L.rampN > 0 && loopCount % L.rampN === 0 && S.rate < 1) {
+    const next = Math.min(1, Math.round((S.rate + 0.25) * 100) / 100);
+    player.setPlaybackRate(next);
+    setStatus(loopCount + '回通過。速度を ' + next + ' に上げます。');
+  }
+  renderLoop();
+  seekVideo(loopSpan().A);
+}
+function renderLoop() {
+  const L = S.loop, sp = loopSpan();
+  $('loopRange').textContent = sp
+    ? '小節 ' + L.from + '〜' + L.to + '(' + fmt(sp.A) + '〜' + fmt(sp.B) + (L.preroll ? '、1小節前から' : '') + ')'
+    : '--';
+  $('loopOn').classList.toggle('on', L.on);
+  $('loopCount').textContent = L.on ? loopCount + '回' : '';
+  $('preroll').checked = L.preroll; $('ramp').checked = L.ramp; $('rampN').value = L.rampN;
+}
+
+// ---------- 表示 ----------
+function renderBeats() {
+  beatsEl.innerHTML = '';
+  for (let i = 0; i < S.bpb; i++) {
+    const d = document.createElement('div'); d.className = 'beat'; d.textContent = i + 1; beatsEl.appendChild(d);
+  }
+}
+let lastLit = -1;
+function draw() {
+  if (ready) {
+    const t = videoTime();
+    const k = beatIndex(t);
+    const bb = barBeat(k);
+    const b = k < 0 ? -1 : bb.b;                 // 曲の前は光らせない
+    if (b !== lastLit) {
+      [...beatsEl.children].forEach((el, i) => {
+        el.classList.toggle('lit', i === b);
+        el.classList.toggle('first', i === b && b === 0);
+      });
+      lastLit = b;
+    }
+    $('bar').textContent = k < 0 ? '--' : bb.bar;
+    $('beat').textContent = k < 0 ? '--' : b + 1;
+    $('time').textContent = fmt(t);
+    // 区間ループ(戻した直後のロック中は判定しない)
+    if (playing && S.loop.on && performance.now() > seekLockUntil) {
+      const sp = loopSpan();
+      if (sp && t >= sp.B - 0.01) onLoopEnd();
+    }
+  }
+  requestAnimationFrame(draw);
+}
+function fmt(t) {
+  if (t < 0) t = 0;
+  const m = Math.floor(t / 60), s = (t - m * 60);
+  return m + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
+}
+function setStatus(msg, err) { const e = $('status'); e.textContent = msg; e.classList.toggle('err', !!err); }
+function markRate() { document.querySelectorAll('.rate').forEach(b => b.classList.toggle('on', +b.dataset.r === S.rate)); }
+function markBpb() { document.querySelectorAll('.bpb').forEach(b => b.classList.toggle('on', +b.dataset.n === S.bpb)); }
+function renderAB() { renderLoop(); }
+
+let loopsStarted = false;
+function startLoops() {
+  if (loopsStarted) return; loopsStarted = true;
+  setInterval(scheduler, 25);
+  // 推定と実際の差が大きければ取り直す(シークや読み込み待ちの後)
+  setInterval(() => {
+    if (!ready || !playing) return;
+    const real = player.getCurrentTime() || 0;
+    if (performance.now() < seekLockUntil) {
+      // 戻し先の近くを返し始めたらロック解除。それまで(古い時刻を返している間)は推定を信じる
+      if (Math.abs(real - seekTarget) < 0.5) { seekLockUntil = 0; reanchor(); }
+      return;
+    }
+    if (Math.abs(real - videoTime()) > 0.03) reanchor();
+  }, 50);
+  requestAnimationFrame(draw);
+}
+
+// ---------- 保存 ----------
+function save() {
+  if (!S.videoId) return;
+  try {
+    localStorage.setItem('ytm:' + S.videoId, JSON.stringify({ bpm: S.bpm, bpb: S.bpb, offset: S.offset, A: S.A, B: S.B, loop: S.loop,
+      beats: S.beats, strength: S.strength, phase: S.phase, phaseManual: S.phaseManual, generated: S.generated, shift: S.shift }));
+    localStorage.setItem('ytm:last', S.videoId);
+  } catch (e) {}
+}
+function restore(id) {
+  try {
+    const d = JSON.parse(localStorage.getItem('ytm:' + id) || 'null');
+    if (!d) return;
+    S.bpm = d.bpm; S.bpb = d.bpb; S.offset = d.offset; S.A = d.A; S.B = d.B;
+    if (d.loop) S.loop = Object.assign({ on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 }, d.loop, { on: false });
+    S.beats = d.beats || null; S.strength = d.strength || null; S.phase = d.phase || 0; S.phaseManual = !!d.phaseManual; S.generated = d.generated || null; S.shift = d.shift || 0;
+    $('bpm').value = S.bpm; $('offset').value = S.offset.toFixed(3);
+    markBpb(); renderBeats(); renderLoop(); renderMode();
+    return true;
+  } catch (e) { return false; }
+}
+// 解析済みの拍データ(<BEATS_DIR>/<id>.json)があれば読む。公開版は同梱した分だけ
+const BEATS_DIR = 'beats';
+const IS_LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+async function fetchBeats(id) {
+  try {
+    const r = await fetch(BEATS_DIR + '/' + id + '.json', { cache: 'no-store' });
+    if (!r.ok) return false;
+    const d = await r.json();
+    if (hasBeats() && d.generated && d.generated === S.generated) return true;   // 保存済みと同じ解析結果
+    applyBeats(d);
+    setStatus('解析済みの拍を読み込みました(' + S.bpm + ' BPM)。再生してください。');
+    return true;
+  } catch (e) { return false; }
+}
+async function analyzeNow() {
+  if (!S.videoId) { setStatus('先に動画を読み込んでください。', true); return; }
+  const btn = $('analyze'); btn.disabled = true; btn.textContent = '解析中(20〜60秒)…';
+  setStatus('音声を落として拍を検出しています…');
+  try {
+    const r = await fetch('/analyze?id=' + S.videoId, { cache: 'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    applyBeats(d);
+    setStatus('解析完了: ' + S.bpm + ' BPM・' + S.beats.length + '拍。ずれていたら曲の1拍目で D、拍が倍/半分なら ×2/÷2。');
+  } catch (e) {
+    setStatus('解析に失敗: ' + e.message + '(起動.bat から開いていますか?)', true);
+  }
+  btn.disabled = false; btn.textContent = '音声を解析して拍を出す';
+}
+function halveBeats() {
+  if (!hasBeats()) return;
+  const keep = (i) => mod(i - S.phase, 2) === 0;
+  const beats = S.beats.filter((_, i) => keep(i));
+  const strength = S.strength ? S.strength.filter((_, i) => keep(i)) : null;
+  S.phase = 0;
+  applyBeats({ beats, strength, tempo: Math.round(S.bpm / 2 * 100) / 100 }, true);
+}
+function doubleBeats() {
+  if (!hasBeats()) return;
+  const beats = [], strength = [];
+  for (let i = 0; i < S.beats.length; i++) {
+    beats.push(S.beats[i]); strength.push(S.strength ? S.strength[i] : 1);
+    if (i + 1 < S.beats.length) { beats.push((S.beats[i] + S.beats[i + 1]) / 2); strength.push(0); }
+  }
+  S.phase = S.phase * 2;
+  applyBeats({ beats, strength: S.strength ? strength : null, tempo: Math.round(S.bpm * 2 * 100) / 100 }, true);
+}
+
+// ---------- 操作 ----------
+function setDownbeat() {
+  if (!ready) return;
+  if (hasBeats()) {
+    const t = videoTime();
+    let k = beatIndex(t);
+    if (k < 0) k = 0;
+    if (k + 1 < S.beats.length && Math.abs(S.beats[k + 1] - t) < Math.abs(S.beats[k] - t)) k++;   // 近いほうの拍
+    S.phase = mod(k, S.bpb); S.phaseManual = true; lastScheduled = null; lastLit = -1; save(); renderMode();
+    setStatus('1拍目を ' + fmt(S.beats[k]) + ' の拍に合わせました。');
+    return;
+  }
+  S.offset = videoTime(); $('offset').value = S.offset.toFixed(3); lastScheduled = null; save();
+  setStatus('1拍目を ' + fmt(S.offset) + ' に合わせました。');
+}
+// 2点目の1拍目からBPMを補正する。オフセット(1点目)からの経過秒を、今のBPMで数えた拍数で割り直す
+function setDownbeat2() {
+  if (!ready) return;
+  if (hasBeats()) { setStatus('解析した拍を使っているのでBPM補正は不要です(ずれるなら D で1拍目を指定)。'); return; }
+  const t = videoTime();
+  const span = t - S.offset;
+  if (span < 4 * beatDur()) { setStatus('先に D で頭の1拍目を決めてから、1小節以上あとの1拍目で E を押してください。', true); return; }
+  let n = Math.round(span / beatDur());
+  n = Math.round(n / S.bpb) * S.bpb;             // 1拍目どうしなので小節の倍数に丸める
+  if (n <= 0) return;
+  const old = S.bpm;
+  S.bpm = Math.round(60 * n / span * 100) / 100;
+  $('bpm').value = S.bpm; lastScheduled = null; save();
+  setStatus('BPM ' + old + ' → ' + S.bpm + ' に補正(' + (n / S.bpb) + '小節 ' + span.toFixed(2) + '秒)。');
+}
+function tap() {
+  const now = performance.now();
+  if (taps.length && now - taps[taps.length - 1] > 2000) taps.length = 0;
+  taps.push(now);
+  if (taps.length >= 2) {
+    const iv = (taps[taps.length - 1] - taps[0]) / (taps.length - 1);
+    S.bpm = Math.round(60000 / iv * 10) / 10; $('bpm').value = S.bpm; lastScheduled = null; save();
+    setStatus('タップ ' + taps.length + ' 回 → ' + S.bpm + ' BPM');
+  } else setStatus('拍に合わせてもう一度…');
+}
+function toggleClick() { S.click = !S.click; $('click').classList.toggle('on', S.click); if (S.click) ensureAudio(); }
+function setA() { setLoopFrom(); }
+function setB() { setLoopTo(); }
+
+$('load').onclick = loadVideo;
+$('url').addEventListener('keydown', e => { if (e.key === 'Enter') loadVideo(); });
+$('bpm').oninput = () => { const v = +$('bpm').value; if (v >= 20 && v <= 400) { S.bpm = v; lastScheduled = null; save(); } };
+$('offset').oninput = () => { const v = +$('offset').value; if (!isNaN(v)) { S.offset = v; lastScheduled = null; save(); } };
+$('lat').oninput = () => { S.latencyMs = +$('lat').value || 0; };
+$('vol').oninput = () => { S.vol = +$('vol').value; if (gain) gain.gain.value = S.vol; };
+$('tap').onclick = tap;
+$('down').onclick = setDownbeat;
+$('down2').onclick = setDownbeat2;
+$('analyze').onclick = analyzeNow;
+$('half').onclick = halveBeats;
+$('double').onclick = doubleBeats;
+$('manual').onclick = () => { S.beats = S.strength = null; S.phase = 0; S.phaseManual = false; lastScheduled = null; lastLit = -1; save(); renderMode(); setStatus('手動(BPM×オフセット)に戻しました。'); };
+$('click').onclick = toggleClick;
+$('loopFrom').onclick = setLoopFrom; $('loopTo').onclick = setLoopTo;
+$('fromM').onclick = () => moveLoop('from', -1); $('fromP').onclick = () => moveLoop('from', 1);
+$('toM').onclick = () => moveLoop('to', -1); $('toP').onclick = () => moveLoop('to', 1);
+$('loopOn').onclick = () => toggleLoop();
+$('loopRestart').onclick = () => { loopCount = 0; renderLoop(); restartLoop(); };
+$('loopClear').onclick = () => { S.loop.on = false; S.loop.from = S.loop.to = null; loopCount = 0; renderLoop(); save(); };
+$('preroll').onchange = () => { S.loop.preroll = $('preroll').checked; renderLoop(); save(); };
+$('ramp').onchange = () => { S.loop.ramp = $('ramp').checked; save(); };
+$('rampN').oninput = () => { const v = +$('rampN').value; if (v >= 1) { S.loop.rampN = v; save(); } };
+document.querySelectorAll('.bpb').forEach(b => b.onclick = () => { S.bpb = +b.dataset.n; autoPhase(); markBpb(); renderBeats(); lastLit = -1; save(); renderMode(); renderLoop(); });
+function nudge(ms) {
+  if (hasBeats()) { S.shift = Math.round((S.shift + ms / 1000) * 1000) / 1000; }
+  else { S.offset += ms / 1000; $('offset').value = S.offset.toFixed(3); }
+  lastScheduled = null; save(); renderShift();
+  setStatus((hasBeats() ? '拍全体を ' : 'オフセットを ') + (ms > 0 ? '+' : '') + ms + 'ms 動かしました' + (hasBeats() ? '(合計 ' + Math.round(S.shift * 1000) + 'ms)' : '') + '。');
+}
+function renderShift() { $('shiftV').textContent = hasBeats() ? (S.shift >= 0 ? '+' : '') + Math.round(S.shift * 1000) + 'ms' : ''; }
+document.querySelectorAll('.nudge').forEach(b => b.onclick = () => nudge(+b.dataset.ms));
+document.querySelectorAll('.rate').forEach(b => b.onclick = () => { if (!ready) return; player.setPlaybackRate(+b.dataset.r); });
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (e.key === 'ArrowLeft') { e.preventDefault(); nudge(e.shiftKey ? -50 : -10); return; }
+  if (e.key === 'ArrowRight') { e.preventDefault(); nudge(e.shiftKey ? 50 : 10); return; }
+  if (k === 'd') setDownbeat(); else if (k === 'e') setDownbeat2(); else if (k === 't') tap(); else if (k === 'm') toggleClick();
+  else if (k === 'a' || e.key === '[') setLoopFrom(); else if (k === 'b' || e.key === ']') setLoopTo();
+  else if (k === 'l') toggleLoop(); else if (k === 'r') { loopCount = 0; renderLoop(); restartLoop(); }
+});
+// 音は最初のクリックで有効化(ブラウザの自動再生制限)
+document.addEventListener('pointerdown', () => ensureAudio(), { once: true });
+
+renderBeats(); renderAB();
+if (!IS_LOCAL) { $('analyze').style.display = 'none'; $('noAnalyze').style.display = ''; }
+try { const last = localStorage.getItem('ytm:last'); if (last) $('url').value = 'https://www.youtube.com/watch?v=' + last; } catch (e) {}
+</script>
+<script src="https://www.youtube.com/iframe_api"></script>
+</body>
+</html>
