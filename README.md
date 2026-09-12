@@ -9,7 +9,7 @@ YouTubeの演奏動画に合わせてメトロノームを鳴らし、同じ小�
 - 手動でも合わせられる: 曲の頭で `D`、後半で `E`
 
 ## 解析済みの曲
-- https://www.youtube.com/watch?v=224w0wYJqbg (165.96 BPM)
+- https://www.youtube.com/watch?v=224w0wYJqbg (165.99 BPM)
 - https://www.youtube.com/watch?v=a5uCd7St2ys (102.7 BPM)
 - https://www.youtube.com/watch?v=_hDWqju9SoE (116.65 BPM)
 

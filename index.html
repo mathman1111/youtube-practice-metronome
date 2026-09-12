@@ -188,7 +188,8 @@ const S = {
   bpm: 120, bpb: 4, offset: 0, latencyMs: 0, click: true, vol: 0.6, rate: 1,
   A: null, B: null, videoId: null,
   loop: { on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 },   // 小節番号(1始まり、to は含む)
-  beats: null, strength: null, phase: 0, phaseManual: false, generated: null,
+  beats: null, strength: null, generated: null,
+  segStarts: [0], phases: [0], phaseManual: [false], tempi: null,   // テンポ区間ごとの最初の拍番号 / 1拍目の位相(区間の先頭からの拍数) / Dで指定したか
   shift: 0,   // 解析した拍を全体でずらす秒数(← → キー)   // 解析した拍(あれば BPM×オフセットより優先)
 };
 let player = null, ready = false, playing = false;
@@ -232,29 +233,50 @@ function beatIndex(t) {
   while (lo <= hi) { const m = (lo + hi) >> 1; if (S.beats[m] <= t + 1e-6) { r = m; lo = m + 1; } else hi = m - 1; }
   return r;
 }
-function isDownbeat(k) { return mod(k - (hasBeats() ? S.phase : 0), S.bpb) === 0; }
-function barBeat(k) { const kk = k - (hasBeats() ? S.phase : 0); return { bar: Math.floor(kk / S.bpb) + 1, b: mod(kk, S.bpb) }; }
-// 拍ごとの強さから1拍目の位置(位相)を推定する
+// 拍 k が属するテンポ区間の番号(手動モードは常に 0)
+function segIndex(k) {
+  if (!hasBeats()) return 0;
+  const ss = S.segStarts; let lo = 0, hi = ss.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (ss[m] <= k) lo = m; else hi = m - 1; }
+  return lo;
+}
+function segRange(s) { return [S.segStarts[s], s + 1 < S.segStarts.length ? S.segStarts[s + 1] : (hasBeats() ? S.beats.length : Infinity)]; }
+// 区間 s の小節数(1拍目より前の端数は数えない)
+function segBars(s) { const [a, b] = segRange(s); return Math.max(0, Math.ceil((b - a - (S.phases[s] || 0)) / S.bpb)); }
+function barsBefore(s) { let n = 0; for (let i = 0; i < s; i++) n += segBars(i); return n; }
+function isDownbeat(k) { if (!hasBeats()) return mod(k, S.bpb) === 0; const s = segIndex(k); return mod(k - S.segStarts[s] - (S.phases[s] || 0), S.bpb) === 0; }
+function barBeat(k) {
+  if (!hasBeats()) return { bar: Math.floor(k / S.bpb) + 1, b: mod(k, S.bpb) };
+  const s = segIndex(k), kk = k - S.segStarts[s] - (S.phases[s] || 0);
+  return { bar: barsBefore(s) + Math.floor(kk / S.bpb) + 1, b: mod(kk, S.bpb) };
+}
+// 拍ごとの強さから、区間ごとに1拍目の位置(位相)を推定する。Dで指定した区間は触らない
 function autoPhase() {
-  if (!hasBeats() || !S.strength || S.phaseManual) return;
-  let best = 0, bestV = -1;
-  for (let ph = 0; ph < S.bpb; ph++) {
-    let v = 0;
-    for (let i = ph; i < S.strength.length; i += S.bpb) v += S.strength[i];
-    if (v > bestV) { bestV = v; best = ph; }
+  if (!hasBeats() || !S.strength) return;
+  for (let s = 0; s < S.segStarts.length; s++) {
+    if (S.phaseManual[s]) continue;
+    const [a, b] = segRange(s);
+    let best = 0, bestV = -1;
+    for (let ph = 0; ph < S.bpb; ph++) {
+      let v = 0;
+      for (let i = a + ph; i < b; i += S.bpb) v += S.strength[i];
+      if (v > bestV) { bestV = v; best = ph; }
+    }
+    S.phases[s] = best;
   }
-  S.phase = best;
 }
 function applyBeats(data, keepPhase) {
   S.beats = data.beats; S.strength = data.strength || null; S.generated = data.generated || null;
-  if (!keepPhase) { S.phaseManual = false; autoPhase(); }
+  S.segStarts = (data.segStarts && data.segStarts.length) ? data.segStarts.slice() : [0];
+  S.tempi = data.tempi || null;
+  if (!keepPhase) { S.phases = S.segStarts.map(() => 0); S.phaseManual = S.segStarts.map(() => false); autoPhase(); }
   if (data.tempo) { S.bpm = data.tempo; $('bpm').value = S.bpm; }
   lastScheduled = null; lastLit = -1; save(); renderMode();
 }
 function renderMode() {
   const has = hasBeats();
   $('beatMode').textContent = has
-    ? '拍: 解析済み(' + S.bpm + ' BPM・' + S.beats.length + '拍・1拍目は' + (S.phaseManual ? 'Dで指定' : '自動推定') + ')'
+    ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
     : '拍: 手動(BPM×オフセット)';
   $('beatOps').style.display = has ? '' : 'none';
   renderShift();
@@ -371,7 +393,16 @@ function scheduler() {
 function mod(a, n) { return ((a % n) + n) % n; }
 
 // ---------- 小節とループ ----------
-function barStartBeat(bar) { return (hasBeats() ? S.phase : 0) + (bar - 1) * S.bpb; }
+function barStartBeat(bar) {
+  if (!hasBeats()) return (bar - 1) * S.bpb;
+  let before = 0;
+  for (let s = 0; s < S.segStarts.length; s++) {
+    const nb = segBars(s), last = s === S.segStarts.length - 1;
+    if (bar <= before + nb || last) return S.segStarts[s] + (S.phases[s] || 0) + (bar - before - 1) * S.bpb;
+    before += nb;
+  }
+  return (bar - 1) * S.bpb;
+}
 // bar小節(1始まり)の頭の動画時刻。解析した最後の拍を越える場合は最後の拍から等間隔で延長
 function barStartTime(bar) {
   const k = barStartBeat(bar);
@@ -514,7 +545,7 @@ function save() {
   if (!S.videoId) return;
   try {
     localStorage.setItem('ytm:' + S.videoId, JSON.stringify({ bpm: S.bpm, bpb: S.bpb, offset: S.offset, A: S.A, B: S.B, loop: S.loop,
-      beats: S.beats, strength: S.strength, phase: S.phase, phaseManual: S.phaseManual, generated: S.generated, shift: S.shift }));
+      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift }));
     localStorage.setItem('ytm:last', S.videoId);
   } catch (e) {}
 }
@@ -524,7 +555,10 @@ function restore(id) {
     if (!d) return;
     S.bpm = d.bpm; S.bpb = d.bpb; S.offset = d.offset; S.A = d.A; S.B = d.B;
     if (d.loop) S.loop = Object.assign({ on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 }, d.loop, { on: false });
-    S.beats = d.beats || null; S.strength = d.strength || null; S.phase = d.phase || 0; S.phaseManual = !!d.phaseManual; S.generated = d.generated || null; S.shift = d.shift || 0;
+    S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0;
+    S.segStarts = (d.segStarts && d.segStarts.length) ? d.segStarts : [0]; S.tempi = d.tempi || null;
+    S.phases = Array.isArray(d.phases) ? d.phases : S.segStarts.map(() => d.phase || 0);
+    S.phaseManual = Array.isArray(d.phaseManual) ? d.phaseManual : S.segStarts.map(() => !!d.phaseManual);
     $('bpm').value = S.bpm; $('offset').value = S.offset.toFixed(3);
     markBpb(); renderBeats(); renderLoop(); renderMode();
     return true;
@@ -745,21 +779,28 @@ async function analyzeNow() {
 }
 function halveBeats() {
   if (!hasBeats()) return;
-  const keep = (i) => mod(i - S.phase, 2) === 0;
-  const beats = S.beats.filter((_, i) => keep(i));
-  const strength = S.strength ? S.strength.filter((_, i) => keep(i)) : null;
-  S.phase = 0;
-  applyBeats({ beats, strength, tempo: Math.round(S.bpm / 2 * 100) / 100 }, true);
+  const keep = (i) => { const s = segIndex(i); return mod(i - S.segStarts[s] - (S.phases[s] || 0), 2) === 0; };
+  const beats = [], strength = [], segStarts = [];
+  for (let i = 0; i < S.beats.length; i++) {
+    if (S.segStarts.includes(i)) segStarts.push(beats.length);
+    if (keep(i)) { beats.push(S.beats[i]); strength.push(S.strength ? S.strength[i] : 1); }
+  }
+  const tempi = S.tempi ? S.tempi.map(t => ({ start: t.start, bpm: Math.round(t.bpm / 2 * 100) / 100 })) : null;
+  applyBeats({ beats, strength: S.strength ? strength : null, segStarts, tempi, tempo: Math.round(S.bpm / 2 * 100) / 100 }, true);
+  S.phases = S.segStarts.map(() => 0); save(); renderMode();
 }
 function doubleBeats() {
   if (!hasBeats()) return;
-  const beats = [], strength = [];
+  const beats = [], strength = [], segStarts = [];
   for (let i = 0; i < S.beats.length; i++) {
+    if (S.segStarts.includes(i)) segStarts.push(beats.length);
     beats.push(S.beats[i]); strength.push(S.strength ? S.strength[i] : 1);
     if (i + 1 < S.beats.length) { beats.push((S.beats[i] + S.beats[i + 1]) / 2); strength.push(0); }
   }
-  S.phase = S.phase * 2;
-  applyBeats({ beats, strength: S.strength ? strength : null, tempo: Math.round(S.bpm * 2 * 100) / 100 }, true);
+  const phases = S.phases.map(p => p * 2), manual = S.phaseManual.slice();
+  const tempi = S.tempi ? S.tempi.map(t => ({ start: t.start, bpm: Math.round(t.bpm * 2 * 100) / 100 })) : null;
+  applyBeats({ beats, strength: S.strength ? strength : null, segStarts, tempi, tempo: Math.round(S.bpm * 2 * 100) / 100 }, true);
+  S.phases = phases; S.phaseManual = manual; save(); renderMode();
 }
 
 // ---------- 操作 ----------
@@ -770,7 +811,7 @@ function setDownbeat() {
     let k = beatIndex(t);
     if (k < 0) k = 0;
     if (k + 1 < S.beats.length && Math.abs(S.beats[k + 1] - t) < Math.abs(S.beats[k] - t)) k++;   // 近いほうの拍
-    S.phase = mod(k, S.bpb); S.phaseManual = true; lastScheduled = null; lastLit = -1; save(); renderMode();
+    const s = segIndex(k); S.phases[s] = mod(k - S.segStarts[s], S.bpb); S.phaseManual[s] = true; lastScheduled = null; lastLit = -1; save(); renderMode();
     setStatus('1拍目を ' + fmt(S.beats[k]) + ' の拍に合わせました。');
     return;
   }
@@ -820,7 +861,7 @@ $('capture').onclick = captureAndAnalyze;
 $('captureStop').onclick = () => { if (capturing) capturing.aborted = true; };
 $('half').onclick = halveBeats;
 $('double').onclick = doubleBeats;
-$('manual').onclick = () => { S.beats = S.strength = null; S.phase = 0; S.phaseManual = false; lastScheduled = null; lastLit = -1; save(); renderMode(); setStatus('手動(BPM×オフセット)に戻しました。'); };
+$('manual').onclick = () => { S.beats = S.strength = null; S.segStarts = [0]; S.phases = [0]; S.phaseManual = [false]; S.tempi = null; lastScheduled = null; lastLit = -1; save(); renderMode(); setStatus('手動(BPM×オフセット)に戻しました。'); };
 $('click').onclick = toggleClick;
 $('loopFrom').onclick = setLoopFrom; $('loopTo').onclick = setLoopTo;
 $('fromM').onclick = () => moveLoop('from', -1); $('fromP').onclick = () => moveLoop('from', 1);
