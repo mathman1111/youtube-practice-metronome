@@ -9,5 +9,6 @@ YouTubeの演奏動画に合わせてメトロノームを鳴らし、同じ小�
 
 ## 解析済みの曲
 - https://www.youtube.com/watch?v=224w0wYJqbg (165.96 BPM)
+- https://www.youtube.com/watch?v=a5uCd7St2ys (102.7 BPM)
 
 解析はローカル版(Python)で行っています。曲の追加希望は Issue へ。

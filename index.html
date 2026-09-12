@@ -85,7 +85,7 @@
         <button class="small" id="double">拍を倍に(×2)</button>
         <button class="small" id="manual">手動に戻す</button>
       </div>
-      <div class="row"><span style="color:var(--dim);font-size:12px">動画の音声を落として拍を検出する(20〜60秒)。1拍目の位置は自動推定。違っていたら曲の1拍目で D を押すと直る</span></div>
+      <div class="row" id="analyzeHint"><span style="color:var(--dim);font-size:12px">動画の音声を落として拍を検出する(20〜60秒)。1拍目の位置は自動推定。違っていたら曲の1拍目で D を押すと直る</span></div>
       <div class="sep"></div>
 
       <h2>テンポ</h2>
@@ -639,7 +639,7 @@ document.addEventListener('keydown', e => {
 document.addEventListener('pointerdown', () => ensureAudio(), { once: true });
 
 renderBeats(); renderAB();
-if (!IS_LOCAL) { $('analyze').style.display = 'none'; $('noAnalyze').style.display = ''; }
+if (!IS_LOCAL) { $('analyze').style.display = 'none'; $('analyzeHint').style.display = 'none'; $('noAnalyze').style.display = ''; }
 try { const last = localStorage.getItem('ytm:last'); if (last) $('url').value = 'https://www.youtube.com/watch?v=' + last; } catch (e) {}
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>
