@@ -190,7 +190,8 @@ const S = {
   loop: { on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 },   // 小節番号(1始まり、to は含む)
   beats: null, strength: null, generated: null,
   segStarts: [0], phases: [0], phaseManual: [false], tempi: null,   // テンポ区間ごとの最初の拍番号 / 1拍目の位相(区間の先頭からの拍数) / Dで指定したか
-  shift: 0,   // 解析した拍を全体でずらす秒数(← → キー)   // 解析した拍(あれば BPM×オフセットより優先)
+  shift: 0,   // 解析した拍を全体でずらす秒数(← → キー)
+  source: 'file',   // 'file' = 音声ファイル基準の拍(同梱・ローカル解析)、'capture' = このブラウザで録った拍(プレーヤーの再生位置基準)   // 解析した拍(あれば BPM×オフセットより優先)
 };
 let player = null, ready = false, playing = false;
 let loopCount = 0;            // 今の範囲を何回通ったか
@@ -223,13 +224,13 @@ function hasBeats() { return !!(S.beats && S.beats.length); }
 // k番目の拍の動画時刻。解析モードで最後の拍を過ぎたら null
 function beatTime(k) {
   if (!hasBeats()) return S.offset + k * beatDur();
-  return k < S.beats.length ? S.beats[k] + S.shift : null;
+  return k < S.beats.length ? S.beats[k] + S.shift + (S.source === 'file' ? playerOffset : 0) : null;
 }
 // 時刻 t が何拍目か(直前の拍の番号。最初の拍より前なら -1)
 function beatIndex(t) {
   if (!hasBeats()) return Math.floor((t - S.offset) / beatDur() + 1e-6);
   let lo = 0, hi = S.beats.length - 1, r = -1;
-  t -= S.shift;
+  t -= S.shift + (S.source === 'file' ? playerOffset : 0);
   while (lo <= hi) { const m = (lo + hi) >> 1; if (S.beats[m] <= t + 1e-6) { r = m; lo = m + 1; } else hi = m - 1; }
   return r;
 }
@@ -266,7 +267,7 @@ function autoPhase() {
   }
 }
 function applyBeats(data, keepPhase) {
-  S.beats = data.beats; S.strength = data.strength || null; S.generated = data.generated || null;
+  S.beats = data.beats; S.strength = data.strength || null; S.generated = data.generated || null; S.source = data.source || 'file';
   S.segStarts = (data.segStarts && data.segStarts.length) ? data.segStarts.slice() : [0];
   S.tempi = data.tempi || null;
   if (!keepPhase) { S.phases = S.segStarts.map(() => 0); S.phaseManual = S.segStarts.map(() => false); autoPhase(); }
@@ -279,6 +280,7 @@ function renderMode() {
     ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
     : '拍: 手動(BPM×オフセット)';
   $('beatOps').style.display = has ? '' : 'none';
+  if (has && S.source === 'file' && playerOffset) $('beatMode').textContent += ' プレーヤー補正 ' + (playerOffset >= 0 ? '+' : '') + Math.round(playerOffset * 1000) + 'ms';
   renderShift();
 }
 
@@ -545,7 +547,7 @@ function save() {
   if (!S.videoId) return;
   try {
     localStorage.setItem('ytm:' + S.videoId, JSON.stringify({ bpm: S.bpm, bpb: S.bpb, offset: S.offset, A: S.A, B: S.B, loop: S.loop,
-      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift }));
+      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift, source: S.source }));
     localStorage.setItem('ytm:last', S.videoId);
   } catch (e) {}
 }
@@ -555,7 +557,7 @@ function restore(id) {
     if (!d) return;
     S.bpm = d.bpm; S.bpb = d.bpb; S.offset = d.offset; S.A = d.A; S.B = d.B;
     if (d.loop) S.loop = Object.assign({ on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 }, d.loop, { on: false });
-    S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0;
+    S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0; S.source = d.source || 'file';
     S.segStarts = (d.segStarts && d.segStarts.length) ? d.segStarts : [0]; S.tempi = d.tempi || null;
     S.phases = Array.isArray(d.phases) ? d.phases : S.segStarts.map(() => d.phase || 0);
     S.phaseManual = Array.isArray(d.phaseManual) ? d.phaseManual : S.segStarts.map(() => !!d.phaseManual);
@@ -583,6 +585,10 @@ async function detectLocalServer() {
 // 3. ビープの位置で「録音の時刻 ↔ AudioContext の時刻」を、再生中に集めた (AudioContext, 動画) の組で「↔ 動画の時刻」を合わせる
 // 4. beat_analyzer.js で拍を出し、動画の時刻に直す
 function setCap(msg) { $('captureStatus').textContent = msg; }
+// プレーヤーの遅れ(秒)。同梱・ローカル解析の拍(音声ファイル基準)に足す。録音解析との差から自動で決まる
+let playerOffset = 0;
+try { playerOffset = +localStorage.getItem('ytm:playerOffset') || 0; } catch (e) {}
+function setPlayerOffset(v) { playerOffset = v; try { localStorage.setItem('ytm:playerOffset', String(v)); } catch (e) {} lastScheduled = null; renderMode(); }
 function nowStamp() { const d = new Date(), z = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate()) + ' ' + z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds()); }
 // 入力をそのまま貯めて、4096サンプルごとに { chunk, firstFrame } をメインスレッドへ送る AudioWorklet
 const RECORDER_WORKLET = `
@@ -669,8 +675,28 @@ async function captureAndAnalyze() {
     setCap('解析中…');
     await new Promise(r => setTimeout(r, 50));
     const res = await analyzeCaptured(cap, csr, beepAt);
+    res.source = 'capture';
+    // 同じ動画の音声ファイル基準の拍があれば、その差 = プレーヤーの報告位置と実際の音の遅れ。全曲の同梱データに適用する
+    let calib = '';
+    const fileBeats = (S.source === 'file' && hasBeats()) ? S.beats : null;
+    if (fileBeats) {
+      const diffs = [];
+      const per = 60 / (res.tempo || S.bpm || 120);
+      for (const t of res.beats) {
+        let lo = 0, hi = fileBeats.length - 1;
+        while (lo < hi) { const m = (lo + hi) >> 1; if (fileBeats[m] < t) lo = m + 1; else hi = m; }
+        const c = [fileBeats[lo], fileBeats[lo - 1]].filter(v => v !== undefined).sort((a, b) => Math.abs(a - t) - Math.abs(b - t))[0];
+        if (c !== undefined && Math.abs(c - t) < per / 3) diffs.push(t - c);
+      }
+      if (diffs.length >= res.beats.length * 0.6) {
+        diffs.sort((a, b) => a - b);
+        const med = diffs[diffs.length >> 1];
+        setPlayerOffset(Math.round(med * 1000) / 1000);
+        calib = ' プレーヤーの遅れ ' + (med >= 0 ? '+' : '') + Math.round(med * 1000) + 'ms を記録(同梱データの曲すべてに適用)。';
+      }
+    }
     applyBeats(res);
-    setCap('解析完了: ' + S.bpm + ' BPM・' + S.beats.length + '拍(位置合わせ ' + res.alignMs + 'ms)。ずれていたら ← → で微調整、1拍目が違えば曲の1拍目で D。');
+    setCap('解析完了: ' + S.bpm + ' BPM・' + S.beats.length + '拍(位置合わせ ' + res.alignMs + 'ms)。' + calib + ' ずれていたら ← → で微調整、1拍目が違えば曲の1拍目で D。');
     setStatus('自動で合わせました。再生してください。');
   } catch (e) {
     setCap('解析に失敗: ' + e.message, true);
