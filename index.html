@@ -77,8 +77,13 @@
       <h2>自動で合わせる</h2>
       <div class="row">
         <button id="analyze" class="primary">音声を解析して拍を出す</button>
-        <span id="noAnalyze" style="display:none;color:var(--dim);font-size:12px">この公開版では自動解析は使えません(解析済みの曲だけ自動で合います)。他の曲は「1拍目の位置」の D → E で合わせてください</span>
+        <span id="noAnalyze" style="display:none"></span>
       </div>
+      <div class="row">
+        <button id="capture" class="primary">音を録って自動で合わせる</button>
+        <button id="captureStop" class="small" style="display:none">中止</button>
+      </div>
+      <div class="row"><span id="captureStatus" style="color:var(--dim);font-size:12px">押すと画面共有の窓が出るので、このタブを選び「タブの音声も共有」にチェック。曲が最初から1回再生され、終わると拍が出ます(Chrome / Edge)</span></div>
       <div class="row"><span id="beatMode" style="color:var(--dim);font-size:12px">拍: 手動(BPM×オフセット)</span></div>
       <div class="row" id="beatOps" style="display:none">
         <button class="small" id="half">拍を半分に(÷2)</button>
@@ -188,6 +193,7 @@ const S = {
 };
 let player = null, ready = false, playing = false;
 let loopCount = 0;            // 今の範囲を何回通ったか
+let capturing = null;         // 録音中の状態(null なら録音していない)
 let seekLockUntil = 0;        // ループで戻した直後、プレーヤーが古い時刻を返す間は推定を信じる(performance.now 基準)
 let seekTarget = 0;
 // 動画時刻の推定用アンカー(getCurrentTimeは更新が粗いので、間を自前で補間する)
@@ -271,11 +277,28 @@ function loadVideo() {
   if (player && ready) { player.loadVideoById(id); return; }
   createPlayer(id);
 }
+// テスト用: window.__testAudioUrl があれば、YouTube の代わりに同じ API を持つ <audio> プレーヤーを使う
+// (自動操作のブラウザでは YouTube が再生を拒否するため。録音→位置合わせ→解析の検証に使う)
+function makeAudioPlayer(url, events) {
+  const el = document.createElement('audio');
+  el.src = url; el.preload = 'auto'; el.controls = true; el.style.width = '100%';
+  const box = $('yt'); box.innerHTML = ''; box.appendChild(el);
+  const fire = (st) => events.onStateChange({ data: st });
+  el.addEventListener('playing', () => fire(YT.PlayerState.PLAYING));
+  el.addEventListener('pause', () => fire(YT.PlayerState.PAUSED));
+  el.addEventListener('waiting', () => fire(YT.PlayerState.BUFFERING));
+  el.addEventListener('ended', () => fire(YT.PlayerState.ENDED));
+  el.addEventListener('ratechange', () => events.onPlaybackRateChange({ data: el.playbackRate }));
+  el.addEventListener('canplay', () => { if (!el._ready) { el._ready = true; setTimeout(events.onReady, 0); } });
+  return {
+    getCurrentTime: () => el.currentTime, getDuration: () => el.duration || 0,
+    seekTo: (t) => { el.currentTime = t; }, playVideo: () => el.play(), pauseVideo: () => el.pause(),
+    setPlaybackRate: (r) => { el.playbackRate = r; }, getPlaybackRate: () => el.playbackRate,
+    loadVideoById: (id) => {}, _el: el,
+  };
+}
 function createPlayer(id) {
-  player = new YT.Player('yt', {
-    videoId: id,
-    playerVars: { rel: 0, modestbranding: 1, playsinline: 1, ...(location.protocol.startsWith('http') ? { origin: location.origin } : {}) },
-    events: {
+  const events = {
       onReady: () => {
         ready = true;
         player.setPlaybackRate(S.rate);
@@ -284,6 +307,7 @@ function createPlayer(id) {
       },
       onStateChange: (e) => {
         const st = e.data;
+        if (capturing && st === YT.PlayerState.ENDED) capturing.ended = true;
         if (st === YT.PlayerState.PLAYING) {
           playing = true; reanchor();
           if (audio && audio.state === 'suspended') audio.resume();
@@ -299,7 +323,12 @@ function createPlayer(id) {
           setStatus('この動画は埋め込み再生できません(コード ' + e.data + ')。', true);
         }
       },
-    },
+  };
+  if (window.__testAudioUrl) { player = makeAudioPlayer(window.__testAudioUrl, events); return; }
+  player = new YT.Player('yt', {
+    videoId: id,
+    playerVars: { rel: 0, modestbranding: 1, playsinline: 1, ...(location.protocol.startsWith('http') ? { origin: location.origin } : {}) },
+    events,
   });
 }
 window.onYouTubeIframeAPIReady = () => { setStatus('URLを貼ってください。'); };
@@ -515,6 +544,167 @@ async function detectLocalServer() {
   } catch (e) {}
   return false;
 }
+// ---------- タブの音を録って解析(ブラウザ内で完結) ----------
+// 1. getDisplayMedia でこのタブの音声を取る  2. 位置合わせ用のビープを鳴らし、動画を頭から1回再生して録る
+// 3. ビープの位置で「録音の時刻 ↔ AudioContext の時刻」を、再生中に集めた (AudioContext, 動画) の組で「↔ 動画の時刻」を合わせる
+// 4. beat_analyzer.js で拍を出し、動画の時刻に直す
+function setCap(msg) { $('captureStatus').textContent = msg; }
+// 入力をそのまま貯めて、4096サンプルごとに { chunk, firstFrame } をメインスレッドへ送る AudioWorklet
+const RECORDER_WORKLET = `
+class Rec extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Float32Array(4096); this.n = 0; this.first = -1; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    if (this.first < 0) this.first = currentFrame;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = ch[i];
+      if (this.n === this.buf.length) {
+        this.port.postMessage({ chunk: this.buf, firstFrame: this.first }, [this.buf.buffer]);
+        this.buf = new Float32Array(4096); this.n = 0; this.first = currentFrame + i + 1;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('metro-recorder', Rec);`;
+let recorderModuleReady = null;
+async function makeRecorderNode(ctx, onChunk) {
+  if (!ctx.audioWorklet) throw new Error('AudioWorklet 非対応');
+  if (!recorderModuleReady) recorderModuleReady = ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([RECORDER_WORKLET], { type: 'application/javascript' })));
+  await recorderModuleReady;
+  const node = new AudioWorkletNode(ctx, 'metro-recorder', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+  node.port.onmessage = (e) => onChunk(e.data.chunk, e.data.firstFrame);
+  return node;
+}
+async function captureAndAnalyze() {
+  if (!ready || !S.videoId) { setStatus('先に動画を読み込んでください。', true); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { setCap('このブラウザは非対応です。Chrome か Edge で開いてください。'); return; }
+  if (capturing) return;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, preferCurrentTab: true, selfBrowserSurface: 'include', systemAudio: 'exclude' });
+  } catch (e) { setCap('共有がキャンセルされました。'); return; }
+  const atrack = stream.getAudioTracks()[0];
+  stream.getVideoTracks().forEach(t => t.stop());
+  if (!atrack) { setCap('「タブの音声も共有」にチェックが入っていませんでした。もう一度押して、チェックを入れてください。', true); return; }
+  ensureAudio();
+  if (audio.state === 'suspended') await audio.resume();
+  const ctx = audio, csr = ctx.sampleRate;
+  const src = ctx.createMediaStreamSource(new MediaStream([atrack]));
+  // 録音は AudioWorklet(音声スレッド)で行う。ScriptProcessor はメインスレッドが詰まると取りこぼし、
+  // 数十msの欠落が「テンポが0.1%速い」として現れ、曲の終わりで200msずれた(実測)
+  const cap = capturing = { chunks: [], firstPlaybackTime: null, pairs: [], ended: false, aborted: false, stalled: 0, lastVt: 0, lastAdvance: 0 };
+  let proc;
+  try {
+    proc = await makeRecorderNode(ctx, (chunk, firstFrame) => {
+      if (cap.firstPlaybackTime === null) cap.firstPlaybackTime = firstFrame / csr;
+      cap.chunks.push({ frame: firstFrame, data: chunk });
+    });
+  } catch (e) { atrack.stop(); setCap('録音の準備に失敗: ' + e.message, true); capturing = null; return; }
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  // 位置合わせ用ビープ(1kHz・60ms)。タブの音として一緒に録れる
+  const beepAt = ctx.currentTime + 0.4;
+  { const o = ctx.createOscillator(), g = ctx.createGain(); o.frequency.value = 1000; g.gain.value = 0.5; o.connect(g); g.connect(ctx.destination); o.start(beepAt); o.stop(beepAt + 0.06); }
+  const clickWas = S.click; S.click = false;
+  const rateWas = S.rate;
+  $('capture').disabled = true; $('captureStop').style.display = '';
+  player.setPlaybackRate(1); player.seekTo(0, true); player.playVideo();
+  const dur = player.getDuration() || 600;
+  const t0 = performance.now();
+  await new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const el = (performance.now() - t0) / 1000;
+      if (playing) cap.pairs.push([ctx.currentTime, player.getCurrentTime()]);
+      else if (!cap.ended && el > 3 && (player.getCurrentTime() || 0) < dur - 1 && cap.pairs.length > 5 && ++cap.stalled % 10 === 0) player.playVideo();   // 途中で止まったら再開(誤って一時停止した等)
+      setCap('録音中 ' + fmt(player.getCurrentTime() || 0) + ' / ' + fmt(dur) + '(曲が終わるまでこのタブを開いたままにしてください)');
+      const vt = player.getCurrentTime() || 0;
+      if (vt > cap.lastVt + 0.05) { cap.lastVt = vt; cap.lastAdvance = el; }
+      if (el - (cap.lastAdvance || 0) > 15 && vt < dur - 1) { cap.aborted = true; cap.abortReason = '動画が15秒進みませんでした'; }
+      if (cap.ended || cap.aborted || el > dur + 8) { clearInterval(iv); resolve(); }
+    }, 100);
+  });
+  atrack.stop(); src.disconnect(); proc.disconnect(); mute.disconnect();
+  player.pauseVideo(); player.seekTo(0, true); player.setPlaybackRate(rateWas);
+  S.click = clickWas; capturing = null;
+  $('capture').disabled = false; $('captureStop').style.display = 'none';
+  if (cap.aborted) { setCap('中止しました。' + (cap.abortReason ? '(' + cap.abortReason + ')' : ''), true); return; }
+  try {
+    setCap('解析中…');
+    await new Promise(r => setTimeout(r, 50));
+    const res = await analyzeCaptured(cap, csr, beepAt);
+    applyBeats(res);
+    setCap('解析完了: ' + S.bpm + ' BPM・' + S.beats.length + '拍(位置合わせ ' + res.alignMs + 'ms)。ずれていたら ← → で微調整、1拍目が違えば曲の1拍目で D。');
+    setStatus('自動で合わせました。再生してください。');
+  } catch (e) {
+    setCap('解析に失敗: ' + e.message, true);
+  }
+}
+async function analyzeCaptured(cap, csr, beepAt) {
+  if (!cap.chunks.length) throw new Error('録音が空です(タブの音声が取れていない可能性)');
+  // 各チャンクは音声スレッドのフレーム番号を持つので、その位置に置く(届かなかったぶんは無音で埋め、時刻をずらさない)
+  const base = cap.chunks[0].frame;
+  const last = cap.chunks[cap.chunks.length - 1];
+  const total = last.frame + last.data.length - base;
+  if (total < csr * 5) throw new Error('録音が短すぎます(タブの音声が取れていない可能性)');
+  const raw = new Float32Array(total);
+  let got = 0;
+  for (const c of cap.chunks) { raw.set(c.data, c.frame - base); got += c.data.length; }
+  cap.firstPlaybackTime = base / csr;
+  cap.lostSec = (total - got) / csr;
+  // ビープの位置(1kHz の Goertzel)。見つかれば録音の時刻を AudioContext の時刻に正確に合わせる
+  let delay = 0, found = false;
+  {
+    const w = 256, k = Math.round(1000 / csr * w), coef = 2 * Math.cos(2 * Math.PI * k / w);
+    const nWin = Math.min(Math.floor(raw.length / w), Math.floor(3 * csr / w));
+    const pw = new Float32Array(nWin);
+    for (let i = 0; i < nWin; i++) {
+      let s0 = 0, s1 = 0, s2 = 0;
+      for (let j = 0; j < w; j++) { s0 = raw[i * w + j] + coef * s1 - s2; s2 = s1; s1 = s0; }
+      pw[i] = s1 * s1 + s2 * s2 - coef * s1 * s2;
+    }
+    let mx = 0, mi = -1; for (let i = 0; i < nWin; i++) if (pw[i] > mx) { mx = pw[i]; mi = i; }
+    const sorted = Array.from(pw).sort((a, b) => a - b), med = sorted[nWin >> 1] || 0;
+    if (mi >= 0 && mx > med * 50 + 1e-6) {
+      let i = mi; while (i > 0 && pw[i - 1] > mx * 0.3) i--;
+      const capTime = i * w / csr;                        // 録音上のビープ位置
+      delay = (cap.firstPlaybackTime + capTime) - beepAt;  // 録音経路の遅れ
+      found = true;
+    }
+  }
+  // AudioContext の時刻 → 動画の時刻。再生中に 100ms ごとに集めた組を区分線形でつなぐ(途中で止まっても、そこだけ正しく対応する)
+  const pairs = cap.pairs.filter(p => p[1] > 0.2).sort((a, b) => a[0] - b[0]);
+  if (pairs.length < 10) throw new Error('動画が再生されませんでした');
+  const ctxToVideoAt = (c) => {
+    if (c <= pairs[0][0]) return pairs[0][1] - (pairs[0][0] - c);
+    if (c >= pairs[pairs.length - 1][0]) return pairs[pairs.length - 1][1] + (c - pairs[pairs.length - 1][0]);
+    let lo = 0, hi = pairs.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (pairs[m][0] <= c) lo = m; else hi = m; }
+    const [c0, v0] = pairs[lo], [c1, v1] = pairs[hi];
+    return v0 + (v1 - v0) * (c - c0) / (c1 - c0);
+  };
+  const ctxToVideo = pairs[pairs.length >> 1][1] - pairs[pairs.length >> 1][0];   // 表示用の代表値
+  // 22.05kHz に落として解析
+  const sr = 22050;
+  const off = new OfflineAudioContext(1, Math.ceil(raw.length * sr / csr), sr);
+  const buf = off.createBuffer(1, raw.length, csr); buf.copyToChannel(raw, 0);
+  const bs = off.createBufferSource(); bs.buffer = buf; bs.connect(off.destination); bs.start(0);
+  const rendered = await off.startRendering();
+  const y = rendered.getChannelData(0);
+  const logs = [];
+  const res = BeatAnalyzer.analyzeBeats(y, sr, { log: (m) => logs.push(m) });
+  window.__lastCapture = { y, sr, raw, csr, firstPlaybackTime: cap.firstPlaybackTime, beepAt, delay, found, ctxToVideo, pairs: cap.pairs, res, logs, stalled: cap.stalled, lostSec: cap.lostSec };   // 検証用
+  // 録音の時刻 → 動画の時刻。ビープは Web Audio の出力遅延(base+output ≈ 50ms)ぶん遅れて録れるので、その分は経路の遅れから除く
+  const waLat = (audio.baseLatency || 0) + (audio.outputLatency || 0);
+  const toVideo = (t) => ctxToVideoAt(cap.firstPlaybackTime + t - (found ? delay - waLat : 0));
+  const dur = player.getDuration() || Infinity;
+  const beats = [], strength = [];
+  res.beats.forEach((t, i) => { const v = toVideo(t); if (v >= 0 && v <= dur) { beats.push(Math.round(v * 1e4) / 1e4); strength.push(res.strength[i]); } });
+  if (beats.length < 8) throw new Error('拍が見つかりませんでした');
+  return { beats, strength, tempo: res.tempo, mode: res.mode + (found ? '' : '-nobeep'), generated: new Date().toISOString().slice(0, 19).replace('T', ' '),
+           alignMs: Math.round((ctxToVideo - (found ? delay - waLat : 0)) * 1000) };
+}
 function renderAnalyzeUI() {
   const can = apiBase !== null;
   $('analyze').style.display = can ? '' : 'none';
@@ -626,6 +816,8 @@ $('tap').onclick = tap;
 $('down').onclick = setDownbeat;
 $('down2').onclick = setDownbeat2;
 $('analyze').onclick = analyzeNow;
+$('capture').onclick = captureAndAnalyze;
+$('captureStop').onclick = () => { if (capturing) capturing.aborted = true; };
 $('half').onclick = halveBeats;
 $('double').onclick = doubleBeats;
 $('manual').onclick = () => { S.beats = S.strength = null; S.phase = 0; S.phaseManual = false; lastScheduled = null; lastLit = -1; save(); renderMode(); setStatus('手動(BPM×オフセット)に戻しました。'); };
@@ -667,5 +859,6 @@ detectLocalServer().then(() => { renderAnalyzeUI(); if (S.videoId) fetchBeats(S.
 try { const last = localStorage.getItem('ytm:last'); if (last) $('url').value = 'https://www.youtube.com/watch?v=' + last; } catch (e) {}
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>
+<script src="beat_analyzer.js"></script>
 </body>
 </html>
