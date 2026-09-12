@@ -583,6 +583,7 @@ async function detectLocalServer() {
 // 3. ビープの位置で「録音の時刻 ↔ AudioContext の時刻」を、再生中に集めた (AudioContext, 動画) の組で「↔ 動画の時刻」を合わせる
 // 4. beat_analyzer.js で拍を出し、動画の時刻に直す
 function setCap(msg) { $('captureStatus').textContent = msg; }
+function nowStamp() { const d = new Date(), z = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate()) + ' ' + z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds()); }
 // 入力をそのまま貯めて、4096サンプルごとに { chunk, firstFrame } をメインスレッドへ送る AudioWorklet
 const RECORDER_WORKLET = `
 class Rec extends AudioWorkletProcessor {
@@ -736,7 +737,7 @@ async function analyzeCaptured(cap, csr, beepAt) {
   const beats = [], strength = [];
   res.beats.forEach((t, i) => { const v = toVideo(t); if (v >= 0 && v <= dur) { beats.push(Math.round(v * 1e4) / 1e4); strength.push(res.strength[i]); } });
   if (beats.length < 8) throw new Error('拍が見つかりませんでした');
-  return { beats, strength, tempo: res.tempo, mode: res.mode + (found ? '' : '-nobeep'), generated: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  return { beats, strength, tempo: res.tempo, mode: res.mode + (found ? '' : '-nobeep'), generated: nowStamp(),
            alignMs: Math.round((ctxToVideo - (found ? delay - waLat : 0)) * 1000) };
 }
 function renderAnalyzeUI() {
@@ -752,10 +753,10 @@ async function fetchBeats(id) {
       try { r = await fetch(LOCAL_API + '/' + encodeURIComponent(BEATS_DIR) + '/' + id + '.json', { cache: 'no-store' }); } catch (e) { r = null; }
       if (r && !r.ok) r = null;
     }
-    if (!r) r = await fetch(BEATS_DIR + '/' + id + '.json', { cache: 'no-store' });
+    if (!r) r = await fetch(BEATS_DIR + '/' + id + '.json?t=' + Date.now(), { cache: 'no-store' });   // GitHub Pages のCDNキャッシュを避ける
     if (!r.ok) return false;
     const d = await r.json();
-    if (hasBeats() && d.generated && d.generated === S.generated) return true;   // 保存済みと同じ解析結果
+    if (hasBeats() && d.generated && S.generated && d.generated <= S.generated) return true;   // 保存済みのほうが新しい(または同じ)ならそのまま
     applyBeats(d);
     setStatus('解析済みの拍を読み込みました(' + S.bpm + ' BPM)。再生してください。');
     return true;
