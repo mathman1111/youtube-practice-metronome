@@ -191,7 +191,8 @@ const S = {
   beats: null, strength: null, generated: null,
   segStarts: [0], phases: [0], phaseManual: [false], tempi: null,   // テンポ区間ごとの最初の拍番号 / 1拍目の位相(区間の先頭からの拍数) / Dで指定したか
   shift: 0,   // 解析した拍を全体でずらす秒数(← → キー)
-  source: 'file',   // 'file' = 音声ファイル基準の拍(同梱・ローカル解析)、'capture' = このブラウザで録った拍(プレーヤーの再生位置基準)   // 解析した拍(あれば BPM×オフセットより優先)
+  source: 'file',   // 'file' = 音声ファイル基準の拍(同梱・ローカル解析)、'capture' = このブラウザで録った拍(プレーヤーの再生位置基準)
+  bpbManual: false,   // 拍子を手で選んだ動画は、解析の推定(3拍子/4拍子)で上書きしない   // 解析した拍(あれば BPM×オフセットより優先)
 };
 let player = null, ready = false, playing = false;
 let loopCount = 0;            // 今の範囲を何回通ったか
@@ -270,6 +271,7 @@ function applyBeats(data, keepPhase) {
   S.beats = data.beats; S.strength = data.strength || null; S.generated = data.generated || null; S.source = data.source || 'file';
   S.segStarts = (data.segStarts && data.segStarts.length) ? data.segStarts.slice() : [0];
   S.tempi = data.tempi || null;
+  if (data.meter && !S.bpbManual && data.meter !== S.bpb) { S.bpb = data.meter; markBpb(); renderBeats(); lastLit = -1; }
   if (!keepPhase) { S.phases = S.segStarts.map(() => 0); S.phaseManual = S.segStarts.map(() => false); autoPhase(); }
   if (data.tempo) { S.bpm = data.tempo; $('bpm').value = S.bpm; }
   lastScheduled = null; lastLit = -1; save(); renderMode();
@@ -277,7 +279,7 @@ function applyBeats(data, keepPhase) {
 function renderMode() {
   const has = hasBeats();
   $('beatMode').textContent = has
-    ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
+    ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + S.bpb + '拍子' + (S.bpbManual ? '(手動)' : '') + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
     : '拍: 手動(BPM×オフセット)';
   $('beatOps').style.display = has ? '' : 'none';
   if (has && S.source === 'file' && playerOffset) $('beatMode').textContent += ' プレーヤー補正 ' + (playerOffset >= 0 ? '+' : '') + Math.round(playerOffset * 1000) + 'ms';
@@ -296,6 +298,7 @@ function loadVideo() {
   const id = parseId($('url').value);
   if (!id) { setStatus('URLから動画IDが読めませんでした。', true); return; }
   S.videoId = id;
+  S.bpbManual = false;
   restore(id); fetchBeats(id);   // 保存済みがあっても、サーバーに新しい解析結果があればそちらを使う
   renderMode();
   if (player && ready) { player.loadVideoById(id); return; }
@@ -547,7 +550,7 @@ function save() {
   if (!S.videoId) return;
   try {
     localStorage.setItem('ytm:' + S.videoId, JSON.stringify({ bpm: S.bpm, bpb: S.bpb, offset: S.offset, A: S.A, B: S.B, loop: S.loop,
-      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift, source: S.source }));
+      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift, source: S.source, bpbManual: S.bpbManual }));
     localStorage.setItem('ytm:last', S.videoId);
   } catch (e) {}
 }
@@ -557,7 +560,7 @@ function restore(id) {
     if (!d) return;
     S.bpm = d.bpm; S.bpb = d.bpb; S.offset = d.offset; S.A = d.A; S.B = d.B;
     if (d.loop) S.loop = Object.assign({ on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 }, d.loop, { on: false });
-    S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0; S.source = d.source || 'file';
+    S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0; S.source = d.source || 'file'; S.bpbManual = !!d.bpbManual;
     S.segStarts = (d.segStarts && d.segStarts.length) ? d.segStarts : [0]; S.tempi = d.tempi || null;
     S.phases = Array.isArray(d.phases) ? d.phases : S.segStarts.map(() => d.phase || 0);
     S.phaseManual = Array.isArray(d.phaseManual) ? d.phaseManual : S.segStarts.map(() => !!d.phaseManual);
@@ -909,7 +912,7 @@ $('loopClear').onclick = () => { S.loop.on = false; S.loop.from = S.loop.to = nu
 $('preroll').onchange = () => { S.loop.preroll = $('preroll').checked; renderLoop(); save(); };
 $('ramp').onchange = () => { S.loop.ramp = $('ramp').checked; save(); };
 $('rampN').oninput = () => { const v = +$('rampN').value; if (v >= 1) { S.loop.rampN = v; save(); } };
-document.querySelectorAll('.bpb').forEach(b => b.onclick = () => { S.bpb = +b.dataset.n; autoPhase(); markBpb(); renderBeats(); lastLit = -1; save(); renderMode(); renderLoop(); });
+document.querySelectorAll('.bpb').forEach(b => b.onclick = () => { S.bpb = +b.dataset.n; S.bpbManual = true; autoPhase(); markBpb(); renderBeats(); lastLit = -1; save(); renderMode(); renderLoop(); });
 function nudge(ms) {
   if (hasBeats()) { S.shift = Math.round((S.shift + ms / 1000) * 1000) / 1000; }
   else { S.offset += ms / 1000; $('offset').value = S.offset.toFixed(3); }

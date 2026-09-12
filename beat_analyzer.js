@@ -59,9 +59,28 @@
   // ---------- 立ち上がり包絡(スペクトラルフラックス) ----------
   function onsetEnvelope(y, sr, nFft, hop, wantChroma) {
     const fft = makeFFT(nFft);
-    // ビン → 音階クラス(60Hz〜5kHz)。小節頭の和音の変化を見るため
-    const binClass = new Int8Array(nFft / 2 + 1).fill(-1);
-    for (let k = 1; k <= nFft / 2; k++) { const f = k * sr / nFft; if (f >= 60 && f <= 5000) binClass[k] = ((Math.round(12 * Math.log2(f / 440)) % 12) + 12) % 12; }
+    // クロマ(12音階)のフィルタ。librosa.filters.chroma と同じ考え方: ビンごとに音高(半音)を求め、
+    // 各音階クラスへガウス重み(ビン幅を考慮)、中音域(C5付近)を重く、フィルタごとに正規化。
+    // 単純な「最寄りの半音」だと低域でビンが半音より粗く、和音の変化が正しく取れなかった(空奏列車で小節頭が1拍ずれた)
+    const nBins = nFft / 2 + 1;
+    const chromaW = [];   // [c] → Float32Array(nBins)
+    if (wantChroma) {
+      const octs = new Float64Array(nBins), bw = new Float64Array(nBins);
+      for (let k = 1; k < nBins; k++) octs[k] = Math.log2(k * sr / nFft / (440 / 16));
+      for (let k = 1; k < nBins - 1; k++) bw[k] = Math.max(12 * (octs[k + 1] - octs[k]), 1);
+      bw[nBins - 1] = 1;
+      for (let c = 0; c < 12; c++) {
+        const w = new Float32Array(nBins); let n2 = 0;
+        for (let k = 1; k < nBins; k++) {
+          const pitch = 12 * octs[k];
+          let D = ((pitch - c) % 12 + 12) % 12; if (D > 6) D -= 12;
+          const v = Math.exp(-0.5 * Math.pow(2 * D / bw[k], 2)) * Math.exp(-0.5 * Math.pow((octs[k] - 5) / 2, 2));
+          w[k] = v; n2 += v * v;
+        }
+        n2 = Math.sqrt(n2) || 1; for (let k = 1; k < nBins; k++) w[k] /= n2;
+        chromaW.push(w);
+      }
+    }
     const win = new Float64Array(nFft);
     for (let i = 0; i < nFft; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / nFft);
     const fb = melFilterbank(sr, nFft, 128);
@@ -84,7 +103,7 @@
         re[i] = (idx >= 0 && idx < y.length ? y[idx] : 0) * win[i]; im[i] = 0;
       }
       fft(re, im);
-      if (chroma) { const o = t * 12; for (let k = 1; k <= half; k++) { const c = binClass[k]; if (c >= 0) chroma[o + c] += re[k] * re[k] + im[k] * im[k]; } for (let c = 0; c < 12; c++) chroma[o + c] = Math.log10(1 + 1e3 * chroma[o + c]); }
+      if (chroma) { const o = t * 12; let mx = 0; for (let c = 0; c < 12; c++) { const w = chromaW[c]; let s = 0; for (let k = 1; k <= half; k++) if (w[k] > 1e-4) s += w[k] * (re[k] * re[k] + im[k] * im[k]); chroma[o + c] = s; mx = Math.max(mx, s); } if (mx > 0) for (let c = 0; c < 12; c++) chroma[o + c] /= mx; }   // フレームごとに最大値で正規化(librosa の chroma_stft と同じ)
       for (let m = 0; m < fb.length; m++) {
         const w = fb[m]; let s = 0;
         for (let k = 0; k <= half; k++) if (w[k]) s += w[k] * (re[k] * re[k] + im[k] * im[k]);
@@ -207,7 +226,7 @@
       let top = results[0];
       for (const r of results.slice(1)) {
         const ratio = r.bpm / top.bpm;
-        if (Math.abs(ratio - 2) < 0.06 && (r.contrast >= top.contrast * 0.8 || r.evidence > top.evidence)) top = r;
+        if (Math.abs(ratio - 2) < 0.06 && (r.contrast >= top.contrast * 0.8 || (r.evidence > top.evidence && r.score >= top.score * 0.3))) top = r;   // 付点の根拠だけで倍に飛ぶのは、評価が桁違いに低くないときだけ
         else if (Math.abs(ratio - 0.5) < 0.015 && top.contrast < r.contrast * 0.8 && !(top.evidence > r.evidence)) top = r;
       }
       return { top, results };
@@ -371,10 +390,33 @@
     const mA = Math.max(...oAll, 1e-9), mL = Math.max(...oLow, 1e-9), mC = Math.max(...oChg, 1e-9);
     // 小節幅のクロマ新規性: 拍 i の前4拍と後4拍の和音の違い(コードは小節頭で変わることが多い)
     const winChroma = (i0, i1) => { const v = new Float32Array(12); for (let i = Math.max(0, i0); i < Math.min(beats.length, i1); i++) for (let c = 0; c < 12; c++) v[c] += beatChroma[i][c]; let n = 0; for (let c = 0; c < 12; c++) n += v[c] * v[c]; n = Math.sqrt(n) || 1; for (let c = 0; c < 12; c++) v[c] /= n; return v; };
-    const oNov = beats.map((_, i) => { if (i < 4 || i + 4 > beats.length) return 0; const a = winChroma(i - 4, i), b = winChroma(i, i + 4); let d = 0; for (let c = 0; c < 12; c++) d += a[c] * b[c]; return Math.max(0, 1 - d); });
+    const novW = (w) => beats.map((_, i) => { if (i < w || i + w > beats.length) return 0; const a = winChroma(i - w, i), b = winChroma(i, i + w); let d = 0; for (let c = 0; c < 12; c++) d += a[c] * b[c]; return Math.max(0, 1 - d); });
+    const oNov2 = novW(2), oNov = novW(4), oNov8 = novW(8), oNov16 = novW(16);
     const mN = Math.max(...oNov, 1e-9);
-    const strength = beats.map((_, i) => Math.round((0.3 * oAll[i] / mA + 0.2 * oLow[i] / mL + 0.2 * oChg[i] / mC + 0.3 * oNov[i] / mN) * 1e4) / 1e4);
-    const features = opts.features ? { rise: oAll.map(v => v / mA), low: oLow.map(v => v / mL), chg: oChg.map(v => v / mC), nov: oNov.map(v => v / mN) } : undefined;
+    // 4つの特徴を、それぞれが「どれだけ位相をはっきり分けるか」(最も強い位相の平均からの突出)で重み付けして合成する。
+    // 空奏列車は音量系がほぼ平ら(26/24/26/25)で和音系が 1拍目を指していたのに、固定の重みで音量系に引かれて1拍ずれた
+    const mN2 = Math.max(...oNov2, 1e-9);
+    const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), oChg.map(v => v / mC), oNov2.map(v => v / mN2), oNov.map(v => v / mN)];
+    const decisive = (f, m) => { const sums = []; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < f.length; i += m) { s += f[i]; c++; } sums.push(c ? s / c : 0); } const mean = sums.reduce((a, b) => a + b, 0) / m; return mean > 0 ? Math.max(0.02, (Math.max(...sums) - mean) / mean) : 0.02; };
+    const wts = feats.map(f => Math.pow(decisive(f, 4), 2));   // 2乗で、はっきり分ける特徴を強く
+    const wsum = wts.reduce((a, b) => a + b, 0);
+    log(`小節頭の特徴の重み: 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 和音変化 ${wts[2].toFixed(3)} 2拍幅の和音 ${wts[3].toFixed(3)} 4拍幅の和音 ${wts[4].toFixed(3)}`);
+    const strength = beats.map((_, i) => Math.round(feats.reduce((acc, f, k) => acc + wts[k] / wsum * f[i], 0) * 1e4) / 1e4);
+    // 拍子の推定(3拍子 か 4拍子 か)。拍ごとの強さを m 拍周期で重ねたとき、最も強い位相がどれだけ突出するかで比べる。
+    // 2拍子と4拍子は音からは区別できない(4/4 は 2/4 を2つ並べたもの)ので、2 は手動
+    let meter = 4;
+    {
+      const f = strength, n = f.length;
+      if (n >= 24) {
+        const mean = f.reduce((a, b) => a + b, 0) / n;
+        const sd = Math.sqrt(f.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n) || 1;
+        const peak = (m) => { let best = -Infinity; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < n; i += m) { s += f[i]; c++; } best = Math.max(best, (s / c - mean) / sd); } return best; };
+        const p3 = peak(3), p4 = peak(4);
+        meter = p3 > p4 * 1.3 && p3 > 0.15 ? 3 : 4;
+        log(`拍子: 3拍子の突出 ${p3.toFixed(2)} / 4拍子の突出 ${p4.toFixed(2)} → ${meter}`);
+      }
+    }
+    const features = opts.features ? { rise: oAll.map(v => v / mA), low: oLow.map(v => v / mL), chg: oChg.map(v => v / mC), nov: oNov.map(v => v / mN), nov2: oNov2, nov8: oNov8, nov16: oNov16 } : undefined;
 
     return {
       tempo: Math.round(g.top.bpm * 100) / 100,
@@ -386,6 +428,7 @@
       duration: Math.round(T * 100) / 100,
       phaseBiasMs: Math.round(biasSum / segments.length * 1000),
       candidates: g.results.map(r => Math.round(r.bpm * 100) / 100),
+      meter,
       features,
     };
   }
