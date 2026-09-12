@@ -10,7 +10,7 @@ YouTubeの演奏動画に合わせてメトロノームを鳴らし、同じ小�
 
 ## 解析済みの曲
 - https://www.youtube.com/watch?v=224w0wYJqbg (165.99 BPM)
-- https://www.youtube.com/watch?v=a5uCd7St2ys (102.7 BPM)
+- https://www.youtube.com/watch?v=a5uCd7St2ys (102.73 BPM)
 - https://www.youtube.com/watch?v=xzoShzMIlIM (175 BPM)
 - https://www.youtube.com/watch?v=_hDWqju9SoE (175 BPM)
 

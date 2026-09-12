@@ -71,6 +71,10 @@
     let prev = null;
     const env = new Float32Array(nFrames);
     const chroma = wantChroma ? new Float32Array(nFrames * 12) : null;
+    // 低域(〜250Hz、キック・ベース)だけの立ち上がり。裏拍にギターが乗る区間でも拍の位置を保つため
+    const melCenters = []; { const mMin = hzToMel(0), mMax = hzToMel(sr / 2); for (let i = 1; i <= 128; i++) melCenters.push(melToHz(mMin + (mMax - mMin) * i / 129)); }
+    const nLow = Math.max(3, melCenters.filter(f => f < 250).length);
+    const envLow = wantChroma ? new Float32Array(nFrames) : null;
     const mel = new Float64Array(fb.length);
     for (let t = 0; t < nFrames; t++) {
       const start = t * hop - half;
@@ -87,14 +91,15 @@
         mel[m] = 10 * Math.log10(Math.max(s, 1e-10));
       }
       if (prev) {
-        let s = 0;
-        for (let m = 0; m < fb.length; m++) s += Math.max(0, mel[m] - prev[m]);
+        let s = 0, sl = 0;
+        for (let m = 0; m < fb.length; m++) { const d = Math.max(0, mel[m] - prev[m]); s += d; if (m < nLow) sl += d; }
         env[t] = s / fb.length;
+        if (envLow) envLow[t] = sl / nLow;
       }
       prev = prev || new Float64Array(fb.length);
       prev.set(mel);
     }
-    return wantChroma ? { env, chroma } : env;
+    return wantChroma ? { env, chroma, envLow } : env;
   }
 
   // ---------- RMS(時間領域のエネルギー) ----------
@@ -126,9 +131,13 @@
     opts = opts || {};
     const log = opts.log || (() => {});
     const hop = 512, nFft = 2048, fps = sr / hop, T = y.length / sr;
-    const { env: onset, chroma } = onsetEnvelope(y, sr, nFft, hop, true);
+    const { env: onset, chroma, envLow: onsetLow } = onsetEnvelope(y, sr, nFft, hop, true);
 
     const envAt = (env, t) => { const f = Math.min(Math.max(Math.round(t * fps), 1), env.length - 2); return Math.max(env[f - 1], env[f], env[f + 1]); };
+    // 追従用: 前後1フレームの max を取らず、線形補間で山の位置を鋭く見る
+    const envSharp = (t) => { const x = Math.min(Math.max(t * fps, 0), onset.length - 1.001), f = Math.floor(x), w = x - f; return onset[f] * (1 - w) + onset[f + 1] * w + onsetLowW * (onsetLow[f] * (1 - w) + onsetLow[f + 1] * w); };
+    // 低域の重み: 全帯域と同じくらいの平均になるよう正規化
+    let onsetLowW = 0; { let a = 0, b = 0; for (let i = 0; i < onset.length; i++) { a += onset[i]; b += onsetLow[i]; } onsetLowW = b > 0 ? a / b : 0; }
     function gridScore(bpm, off, a, b) {
       a = a || 0; b = b === undefined ? T : b;
       const per = 60 / bpm; let s = 0, n = 0;
@@ -223,16 +232,16 @@
         const acL = autocorr(Math.round(a * fps), Math.round(b * fps));
         const { out: lc, add: addL } = acPeaks(acL, 3);
         addL(gBpm);
-        const r = chooseTempo(lc, a, b, acL, gBpm, 0.6, 0.04);   // 全体テンポ中心の事前分布で倍/半分の取り違えを防ぐ
+        const r = chooseTempo(lc, a, b, acL, gBpm, 0.6, 0.06);   // 全体テンポ中心の事前分布で倍/半分の取り違えを防ぐ。±6% は自己相関の整数ラグの粗さ(140BPM付近で5%刻み)を吸収するため
         // 全体テンポのグリッド(位相はこの窓で合わせ直す)のコントラストと比べ、局所テンポが明らかに勝つ窓だけ「変化」とみなす。
         // 半分・2/3・3/4 など単純な比の候補は拍の階層の取り違えなので変化と数えない(一定テンポの曲の静かな所で 83 や 110 が出た)
         const gr = refine(gBpm, a, b, 0.015);
         const gContrast = gr[0] - gridScore(gr[1], gr[2] + 30 / gr[1], a, b);
         const ratio = r.top.bpm / gBpm;
-        const simple = [0.5, 2, 2 / 3, 1.5, 0.75, 4 / 3, 1 / 3, 3].some(q => Math.abs(ratio / q - 1) < 0.015);
-        const changed = !simple && Math.abs(ratio - 1) > 0.03 && r.top.contrast > gContrast * 1.6 && r.top.contrast > 0.05;
+        const simple = [0.5, 2, 2 / 3, 1.5, 0.75, 4 / 3, 1 / 3, 3].some(q => Math.abs(ratio / q - 1) < 0.04);   // 局所推定は3%程度ずれる(付点8分の区間で 137 が 141 と出た)ので 4% まで同一視
+        const changed = !simple && Math.abs(ratio - 1) > 0.06 && r.top.contrast > gContrast * 1.6 && r.top.contrast > 0.05;   // 6%未満の変化・ゆるやかな変化は追従(トラッカー)が吸収する
         wins.push({ a, b, bpm: changed ? r.top.bpm : gr[1], contrast: r.top.contrast, changed });
-        if (opts.debugWins) log(`窓 ${a}s: 局所 ${r.top.bpm.toFixed(1)} c=${r.top.contrast.toFixed(2)} 全体グリッド c=${gContrast.toFixed(2)} ${changed ? '変化' : ''}`);
+        if (opts.debugWins) { const perG = 60 / gBpm; const ph = (((gr[2] - g.top.off) % perG) + perG) % perG; log(`窓 ${a}s: 局所 ${r.top.bpm.toFixed(1)} c=${r.top.contrast.toFixed(2)} 全体グリッド ${gr[1].toFixed(2)} c=${gContrast.toFixed(2)} 位相 ${(ph * 1000).toFixed(0)}ms ${changed ? '変化' : ''}`); }
       }
       // 「変化」と判定された窓が、テンポの近い(2%以内)まま 3窓以上(12秒以上)続いたときだけ別区間にする。
       // 1〜2窓だけの変化はフィルや静かな所での取り違え(一定テンポの曲で 99〜108秒に 127BPM が出た)
@@ -262,7 +271,6 @@
     const rms = rmsEnvelope(y, 256, hopE);
     const denv = new Float32Array(rms.length);
     for (let i = 1; i < rms.length; i++) denv[i] = Math.max(0, rms[i] - rms[i - 1]);
-    function energyScore(bpm, o, a, b) { const per = 60 / bpm; let s = 0, n = 0; let t = o; if (t < a) t += Math.ceil((a - t) / per) * per; for (; t < b; t += per) { const f = Math.min(Math.max(Math.round(t * fpsE), 0), denv.length - 1); s += denv[f]; n++; } return n ? s / n : 0; }
 
     // 4. 区間ごとに BPM×位相を詰めてグリッドを置く。1区間なら 20秒窓の位相ずれも補間で吸収
     let beats = [], segStarts = [], tempi = [], biasSum = 0;
@@ -270,36 +278,44 @@
       const single = segments.length === 1;
       const [, bpm, off0] = single ? [0, g.top.bpm, g.top.off] : refine(sg.bpm || sg.bpm0, sg.a, sg.b, 0.03);
       const per = 60 / bpm;
-      let eb = [-1, 0];
-      for (let d = -per / 3; d < per / 3; d += 0.001) { const sc = energyScore(bpm, off0 + d, sg.a, sg.b); if (sc > eb[0]) eb = [sc, d]; }
-      const bias = eb[1]; biasSum += bias;
-      let off = off0 + bias;
-      // 位相ずれの補間(区間内を 20秒窓で)
-      const win = 20, centers = [], shifts = [];
-      for (let a = sg.a; a <= Math.max(sg.b - win, sg.a) + 1e-9; a += win / 2) {
-        const b = Math.min(a + win, sg.b);
-        const base = gridScore(bpm, off, a, b);
-        let best = [-1, 0];
-        for (let d = -per / 2; d < per / 2; d += 0.004) { const sc = gridScore(bpm, off + d, a, b); if (sc > best[0]) best = [sc, d]; }
-        centers.push((a + b) / 2); shifts.push(best[0] < base * 1.03 ? 0 : best[1]);
-        if (b >= sg.b) break;
-      }
-      if (shifts.length >= 3) {
-        const md = shifts.map((_, i) => { const v = shifts.slice(Math.max(0, i - 2), i + 3).slice().sort((x, y) => x - y); return v[v.length >> 1]; });
-        for (let i = 0; i < shifts.length; i++) if (Math.abs(shifts[i] - md[i]) > per * 0.2) shifts[i] = md[i];
-      }
-      const interp = (x) => {
-        if (centers.length < 2) return shifts[0] || 0;
-        if (x <= centers[0]) return shifts[0];
-        if (x >= centers[centers.length - 1]) return shifts[shifts.length - 1];
-        let i = 1; while (centers[i] < x) i++;
-        const w = (x - centers[i - 1]) / (centers[i] - centers[i - 1]);
-        return shifts[i - 1] * (1 - w) + shifts[i] * w;
-      };
-      // 区間の外側 6秒まで延長して置いておき、境界を詰めてから切る
+      // 追従: 8秒窓を4秒ずつ進め、直前の拍から外挿した位置の±半拍・テンポ±3%の範囲で最も音に乗る拍列を選ぶ。
+      // 固定グリッドだと、生バンドの曲(90'S TOKYO BOYS で 102.6→100 BPM に2.5%遅くなる)で後半の拍が1拍ずれた
+      const W2 = 8, ST = 4;
       const grid = [];
-      let t = off; while (t - per >= Math.max(0, sg.a - 6)) t -= per;
-      for (; t < Math.min(T, sg.b + 6); t += per) { const v = t + interp(Math.min(Math.max(t, sg.a), sg.b)); if (v >= 0 && v < T) grid.push(v); }
+      let curBpm = bpm;
+      let t0 = off0; while (t0 - per >= Math.max(0, sg.a - 6)) t0 -= per;
+      let t = t0; while (t < sg.a) { grid.push(t); t += per; }
+      let last = grid.length ? grid[grid.length - 1] : t0 - per;
+      for (let a = sg.a; a < sg.b; a += ST) {
+        const b = Math.min(a + W2, sg.b + 6);
+        let best = null;
+        for (let bpmC = curBpm * 0.97; bpmC <= curBpm * 1.03; bpmC += curBpm * 0.0025) {
+          const perC = 60 / bpmC;
+          for (let d = -perC / 4; d <= perC / 4; d += 0.004) {   // 1窓で動かせるのは±1/4拍まで(裏拍に乗ったギターに引かれて半拍飛ぶのを防ぐ)
+            let sc = 0, n = 0;
+            for (let tt = last + perC + d; tt < b; tt += perC) { sc += envSharp(tt); n++; }
+            if (!n) continue;
+            // 連続性: 外挿からのずれとテンポの変化に軽いペナルティ(音が無い所では外挿を保つ)
+            sc = (sc / n) * (1 - 1.0 * Math.abs(bpmC / curBpm - 1) - 0.3 * Math.pow(d / (perC / 4), 2));   // ずれは2乗で軽く抑える(小さな補正は自由、大きな飛びは高い)
+            if (!best || sc > best.sc) best = { sc, bpm: bpmC, d, per: perC };
+          }
+        }
+        const end = Math.min(a + ST, sg.b);
+        let tt = last + best.per + best.d;
+        while (tt < end) { grid.push(tt); last = tt; tt += best.per; }
+        curBpm = best.bpm;
+      }
+      { let tt = last + 60 / curBpm; while (tt < Math.min(T, sg.b + 6)) { grid.push(tt); tt += 60 / curBpm; } }
+      // 立ち上がり基準の位相補正(追従後の拍列全体を、時間領域のエネルギー増加が最大になる位置へ)
+      let eb = [-1, 0];
+      for (let d = -per / 3; d < per / 3; d += 0.001) {
+        let sc = 0, n = 0;
+        for (const v of grid) { if (v < sg.a || v >= sg.b) continue; const f = Math.min(Math.max(Math.round((v + d) * fpsE), 0), denv.length - 1); sc += denv[f]; n++; }
+        sc = n ? sc / n : 0;
+        if (sc > eb[0]) eb = [sc, d];
+      }
+      const bias = eb[1]; biasSum += bias;
+      for (let i = 0; i < grid.length; i++) grid[i] += bias;
       sg.grid = grid; sg.bpm = bpm;
     } };
     // 4b. 隣り合う区間の境界を、両側のグリッドが最も音に乗る位置に動かす(±6秒、0.25秒刻み)。
