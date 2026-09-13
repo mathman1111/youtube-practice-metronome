@@ -391,16 +391,23 @@
     // 小節幅のクロマ新規性: 拍 i の前4拍と後4拍の和音の違い(コードは小節頭で変わることが多い)
     const winChroma = (i0, i1) => { const v = new Float32Array(12); for (let i = Math.max(0, i0); i < Math.min(beats.length, i1); i++) for (let c = 0; c < 12; c++) v[c] += beatChroma[i][c]; let n = 0; for (let c = 0; c < 12; c++) n += v[c] * v[c]; n = Math.sqrt(n) || 1; for (let c = 0; c < 12; c++) v[c] /= n; return v; };
     const novW = (w) => beats.map((_, i) => { if (i < w || i + w > beats.length) return 0; const a = winChroma(i - w, i), b = winChroma(i, i + w); let d = 0; for (let c = 0; c < 12; c++) d += a[c] * b[c]; return Math.max(0, 1 - d); });
-    const oNov2 = novW(2), oNov = novW(4), oNov8 = novW(8), oNov16 = novW(16);
+    // 時刻ベースの新規性: τ の前 w 拍と後 w 拍のクロマの違い。和音は小節頭の半拍前に先取りして変わることが多い(空奏列車)ので、
+    // 拍 k の値 = τ=拍k と τ=拍k−半拍 の合計にする(先取りぶんを拍 k に寄せる)。拍 k−1 に付くと小節頭が1拍前に見えてしまう
+    const chromaAtTime = (t0, t1) => { const f0 = Math.min(Math.max(Math.round(t0 * fps), 0), onset.length - 1), f1 = Math.min(Math.max(Math.round(t1 * fps), f0 + 1), onset.length); const v = new Float32Array(12); for (let f = f0; f < f1; f++) for (let c = 0; c < 12; c++) v[c] += chroma[f * 12 + c]; let n = 0; for (let c = 0; c < 12; c++) n += v[c] * v[c]; n = Math.sqrt(n) || 1; for (let c = 0; c < 12; c++) v[c] /= n; return v; };
+    const novAt = (tau, wSec) => { if (tau - wSec < 0 || tau + wSec > T) return 0; const a = chromaAtTime(tau - wSec, tau), b = chromaAtTime(tau, tau + wSec); let d = 0; for (let c = 0; c < 12; c++) d += a[c] * b[c]; return Math.max(0, 1 - d); };
+    const perOf = (i) => (i + 1 < beats.length ? beats[i + 1] - beats[i] : (i > 0 ? beats[i] - beats[i - 1] : 0.5));
+    const novFold = (w) => beats.map((t, i) => { const per = perOf(i); return novAt(t, w * per) + novAt(t - per / 2, w * per); });
+    const oNov2 = novFold(2), oNov = novFold(4), oNov8 = novW(8), oNov16 = novW(16);
     const mN = Math.max(...oNov, 1e-9);
     // 4つの特徴を、それぞれが「どれだけ位相をはっきり分けるか」(最も強い位相の平均からの突出)で重み付けして合成する。
     // 空奏列車は音量系がほぼ平ら(26/24/26/25)で和音系が 1拍目を指していたのに、固定の重みで音量系に引かれて1拍ずれた
     const mN2 = Math.max(...oNov2, 1e-9);
-    const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), oChg.map(v => v / mC), oNov2.map(v => v / mN2), oNov.map(v => v / mN)];
+    // 1拍単位の和音変化(oChg)は先取りで1拍前に付くので合成には使わない(空奏列車で1拍前を指した)
+    const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), oNov2.map(v => v / mN2), oNov.map(v => v / mN)];
     const decisive = (f, m) => { const sums = []; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < f.length; i += m) { s += f[i]; c++; } sums.push(c ? s / c : 0); } const mean = sums.reduce((a, b) => a + b, 0) / m; return mean > 0 ? Math.max(0.02, (Math.max(...sums) - mean) / mean) : 0.02; };
     const wts = feats.map(f => Math.pow(decisive(f, 4), 2));   // 2乗で、はっきり分ける特徴を強く
     const wsum = wts.reduce((a, b) => a + b, 0);
-    log(`小節頭の特徴の重み: 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 和音変化 ${wts[2].toFixed(3)} 2拍幅の和音 ${wts[3].toFixed(3)} 4拍幅の和音 ${wts[4].toFixed(3)}`);
+    log(`小節頭の特徴の重み: 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 2拍幅の和音 ${wts[2].toFixed(3)} 4拍幅の和音 ${wts[3].toFixed(3)}`);
     const strength = beats.map((_, i) => Math.round(feats.reduce((acc, f, k) => acc + wts[k] / wsum * f[i], 0) * 1e4) / 1e4);
     // 拍子の推定(3拍子 か 4拍子 か)。拍ごとの強さを m 拍周期で重ねたとき、最も強い位相がどれだけ突出するかで比べる。
     // 2拍子と4拍子は音からは区別できない(4/4 は 2/4 を2つ並べたもの)ので、2 は手動

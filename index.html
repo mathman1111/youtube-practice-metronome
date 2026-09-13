@@ -852,6 +852,9 @@ function setDownbeat() {
     if (k < 0) k = 0;
     if (k + 1 < S.beats.length && Math.abs(S.beats[k + 1] - t) < Math.abs(S.beats[k] - t)) k++;   // 近いほうの拍
     const s = segIndex(k); S.phases[s] = mod(k - S.segStarts[s], S.bpb); S.phaseManual[s] = true; lastScheduled = null; lastLit = -1; save(); renderMode();
+    // ローカル版なら、押した位置を記録に残す(小節頭の推定を直すための正解データになる)
+    if (apiBase !== null) fetch(apiBase + '/debug/D_' + S.videoId + '_' + nowStamp().replace(/[: ]/g, '-') + '.json', { method: 'POST',
+      body: JSON.stringify({ videoId: S.videoId, pressedAt: t, beatIndex: k, beatTime: S.beats[k], bpb: S.bpb, phaseBefore: S.phases, source: S.source, generated: S.generated }) }).catch(() => {});
     setStatus('1拍目を ' + fmt(S.beats[k]) + ' の拍に合わせました。');
     return;
   }
