@@ -242,15 +242,17 @@ function segIndex(k) {
   while (lo < hi) { const m = (lo + hi + 1) >> 1; if (ss[m] <= k) lo = m; else hi = m - 1; }
   return lo;
 }
+// 区間 s の拍子。解析が区間ごとに拍子を出した曲(空奏列車: 6拍子→4拍子)は S.meters に入り、無ければ全体の S.bpb
+function bpbOf(s) { return (S.meters && S.meters[s]) || S.bpb; }
 function segRange(s) { return [S.segStarts[s], s + 1 < S.segStarts.length ? S.segStarts[s + 1] : (hasBeats() ? S.beats.length : Infinity)]; }
 // 区間 s の小節数(1拍目より前の端数は数えない)
-function segBars(s) { const [a, b] = segRange(s); return Math.max(0, Math.ceil((b - a - (S.phases[s] || 0)) / S.bpb)); }
+function segBars(s) { const [a, b] = segRange(s); return Math.max(0, Math.ceil((b - a - (S.phases[s] || 0)) / bpbOf(s))); }
 function barsBefore(s) { let n = 0; for (let i = 0; i < s; i++) n += segBars(i); return n; }
-function isDownbeat(k) { if (!hasBeats()) return mod(k, S.bpb) === 0; const s = segIndex(k); return mod(k - S.segStarts[s] - (S.phases[s] || 0), S.bpb) === 0; }
+function isDownbeat(k) { if (!hasBeats()) return mod(k, S.bpb) === 0; const s = segIndex(k); return mod(k - S.segStarts[s] - (S.phases[s] || 0), bpbOf(s)) === 0; }
 function barBeat(k) {
   if (!hasBeats()) return { bar: Math.floor(k / S.bpb) + 1, b: mod(k, S.bpb) };
   const s = segIndex(k), kk = k - S.segStarts[s] - (S.phases[s] || 0);
-  return { bar: barsBefore(s) + Math.floor(kk / S.bpb) + 1, b: mod(kk, S.bpb) };
+  return { bar: barsBefore(s) + Math.floor(kk / bpbOf(s)) + 1, b: mod(kk, bpbOf(s)), n: bpbOf(s) };
 }
 // 拍ごとの強さから、区間ごとに1拍目の位置(位相)を推定する。Dで指定した区間は触らない
 function autoPhase() {
@@ -259,9 +261,9 @@ function autoPhase() {
     if (S.phaseManual[s]) continue;
     const [a, b] = segRange(s);
     let best = 0, bestV = -1;
-    for (let ph = 0; ph < S.bpb; ph++) {
+    for (let ph = 0; ph < bpbOf(s); ph++) {
       let v = 0;
-      for (let i = a + ph; i < b; i += S.bpb) v += S.strength[i];
+      for (let i = a + ph; i < b; i += bpbOf(s)) v += S.strength[i];
       if (v > bestV) { bestV = v; best = ph; }
     }
     S.phases[s] = best;
@@ -272,6 +274,14 @@ function applyBeats(data, keepPhase) {
   S.segStarts = (data.segStarts && data.segStarts.length) ? data.segStarts.slice() : [0];
   S.tempi = data.tempi || null;
   if (data.meter && !S.bpbManual && data.meter !== S.bpb) { S.bpb = data.meter; markBpb(); renderBeats(); lastLit = -1; }
+  // 区間ごとの拍子(解析が出したもの)。手で選んだ区間(meterManual)は、区間の切れ目が同じなら残す
+  const ms = S.tempi && S.tempi.some(t => t.meter) ? S.tempi.map(t => t.meter || data.meter || S.bpb) : null;
+  if (ms && ms.some(m => m !== ms[0])) {
+    const old = S.meters || [], oldM = S.meterManual || [], same = (i) => oldM[i] && S.segStarts[i] === (S.savedSegStarts || [])[i];
+    S.meters = ms.map((m, i) => same(i) ? old[i] : m); S.meterManual = S.meters.map((_, i) => !!same(i));
+  } else { S.meters = null; S.meterManual = null; }
+  S.savedSegStarts = S.segStarts.slice();
+  renderBeats(); lastLit = -1;
   if (!keepPhase) { S.phases = S.segStarts.map(() => 0); S.phaseManual = S.segStarts.map(() => false); autoPhase(); }
   if (data.tempo) { S.bpm = data.tempo; $('bpm').value = S.bpm; }
   lastScheduled = null; lastLit = -1; save(); renderMode();
@@ -279,7 +289,7 @@ function applyBeats(data, keepPhase) {
 function renderMode() {
   const has = hasBeats();
   $('beatMode').textContent = has
-    ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + S.bpb + '拍子' + (S.bpbManual ? '(手動)' : '') + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
+    ? '拍: 解析済み(' + (S.tempi && S.tempi.length > 1 ? S.tempi.map(t => t.bpm).join('→') + ' BPM・' + S.tempi.length + '区間' : S.bpm + ' BPM') + '・' + (S.meters ? S.meters.join('→') + '拍子(区間ごと' + (S.meterManual && S.meterManual.some(v => v) ? '・一部手動' : '') + ')' : S.bpb + '拍子' + (S.bpbManual ? '(手動)' : '')) + '・' + S.beats.length + '拍・1拍目は' + (S.phaseManual.some(v => v) ? 'Dで指定' : '自動推定') + ')'
     : '拍: 手動(BPM×オフセット)';
   $('beatOps').style.display = has ? '' : 'none';
   if (has && S.source === 'file' && playerOffset) $('beatMode').textContent += ' プレーヤー補正 ' + (playerOffset >= 0 ? '+' : '') + Math.round(playerOffset * 1000) + 'ms';
@@ -403,7 +413,7 @@ function barStartBeat(bar) {
   let before = 0;
   for (let s = 0; s < S.segStarts.length; s++) {
     const nb = segBars(s), last = s === S.segStarts.length - 1;
-    if (bar <= before + nb || last) return S.segStarts[s] + (S.phases[s] || 0) + (bar - before - 1) * S.bpb;
+    if (bar <= before + nb || last) return S.segStarts[s] + (S.phases[s] || 0) + (bar - before - 1) * bpbOf(s);
     before += nb;
   }
   return (bar - 1) * S.bpb;
@@ -486,9 +496,13 @@ function renderLoop() {
 }
 
 // ---------- 表示 ----------
-function renderBeats() {
+let shownBpb = 0;
+function curSeg() { return hasBeats() ? segIndex(Math.max(0, beatIndex(ready ? videoTime() : 0))) : 0; }
+function renderBeats(n) {
+  n = n || (hasBeats() ? bpbOf(curSeg()) : S.bpb);
+  shownBpb = n;
   beatsEl.innerHTML = '';
-  for (let i = 0; i < S.bpb; i++) {
+  for (let i = 0; i < n; i++) {
     const d = document.createElement('div'); d.className = 'beat'; d.textContent = i + 1; beatsEl.appendChild(d);
   }
 }
@@ -499,6 +513,7 @@ function draw() {
     const k = beatIndex(t);
     const bb = barBeat(k);
     const b = k < 0 ? -1 : bb.b;                 // 曲の前は光らせない
+    if (bb.n && bb.n !== shownBpb) { renderBeats(bb.n); markBpb(); lastLit = -1; }   // 拍子が変わる区間に入ったら拍の表示を作り直す
     if (b !== lastLit) {
       [...beatsEl.children].forEach((el, i) => {
         el.classList.toggle('lit', i === b);
@@ -524,7 +539,7 @@ function fmt(t) {
 }
 function setStatus(msg, err) { const e = $('status'); e.textContent = msg; e.classList.toggle('err', !!err); }
 function markRate() { document.querySelectorAll('.rate').forEach(b => b.classList.toggle('on', +b.dataset.r === S.rate)); }
-function markBpb() { document.querySelectorAll('.bpb').forEach(b => b.classList.toggle('on', +b.dataset.n === S.bpb)); }
+function markBpb() { const cur = hasBeats() ? bpbOf(curSeg()) : S.bpb; document.querySelectorAll('.bpb').forEach(b => b.classList.toggle('on', +b.dataset.n === cur)); }
 function renderAB() { renderLoop(); }
 
 let loopsStarted = false;
@@ -550,7 +565,7 @@ function save() {
   if (!S.videoId) return;
   try {
     localStorage.setItem('ytm:' + S.videoId, JSON.stringify({ bpm: S.bpm, bpb: S.bpb, offset: S.offset, A: S.A, B: S.B, loop: S.loop,
-      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift, source: S.source, bpbManual: S.bpbManual }));
+      beats: S.beats, strength: S.strength, segStarts: S.segStarts, phases: S.phases, phaseManual: S.phaseManual, tempi: S.tempi, generated: S.generated, shift: S.shift, source: S.source, bpbManual: S.bpbManual, meters: S.meters, meterManual: S.meterManual }));
     localStorage.setItem('ytm:last', S.videoId);
   } catch (e) {}
 }
@@ -562,6 +577,7 @@ function restore(id) {
     if (d.loop) S.loop = Object.assign({ on: false, from: null, to: null, preroll: false, ramp: false, rampN: 3 }, d.loop, { on: false });
     S.beats = d.beats || null; S.strength = d.strength || null; S.generated = d.generated || null; S.shift = d.shift || 0; S.source = d.source || 'file'; S.bpbManual = !!d.bpbManual;
     S.segStarts = (d.segStarts && d.segStarts.length) ? d.segStarts : [0]; S.tempi = d.tempi || null;
+    S.meters = Array.isArray(d.meters) && d.meters.length === S.segStarts.length ? d.meters : null; S.meterManual = S.meters ? (Array.isArray(d.meterManual) ? d.meterManual : S.meters.map(() => false)) : null; S.savedSegStarts = S.segStarts.slice();
     S.phases = Array.isArray(d.phases) ? d.phases : S.segStarts.map(() => d.phase || 0);
     S.phaseManual = Array.isArray(d.phaseManual) ? d.phaseManual : S.segStarts.map(() => !!d.phaseManual);
     $('bpm').value = S.bpm; $('offset').value = S.offset.toFixed(3);
@@ -851,10 +867,10 @@ function setDownbeat() {
     let k = beatIndex(t);
     if (k < 0) k = 0;
     if (k + 1 < S.beats.length && Math.abs(S.beats[k + 1] - t) < Math.abs(S.beats[k] - t)) k++;   // 近いほうの拍
-    const s = segIndex(k); S.phases[s] = mod(k - S.segStarts[s], S.bpb); S.phaseManual[s] = true; lastScheduled = null; lastLit = -1; save(); renderMode();
+    const s = segIndex(k); S.phases[s] = mod(k - S.segStarts[s], bpbOf(s)); S.phaseManual[s] = true; lastScheduled = null; lastLit = -1; save(); renderMode();
     // ローカル版なら、押した位置を記録に残す(小節頭の推定を直すための正解データになる)
     if (apiBase !== null) fetch(apiBase + '/debug/D_' + S.videoId + '_' + nowStamp().replace(/[: ]/g, '-') + '.json', { method: 'POST',
-      body: JSON.stringify({ videoId: S.videoId, pressedAt: t, beatIndex: k, beatTime: S.beats[k], bpb: S.bpb, phaseBefore: S.phases, source: S.source, generated: S.generated }) }).catch(() => {});
+      body: JSON.stringify({ videoId: S.videoId, pressedAt: t, beatIndex: k, beatTime: S.beats[k], bpb: bpbOf(s), phaseBefore: S.phases, source: S.source, generated: S.generated }) }).catch(() => {});
     setStatus('1拍目を ' + fmt(S.beats[k]) + ' の拍に合わせました。');
     return;
   }
@@ -915,7 +931,17 @@ $('loopClear').onclick = () => { S.loop.on = false; S.loop.from = S.loop.to = nu
 $('preroll').onchange = () => { S.loop.preroll = $('preroll').checked; renderLoop(); save(); };
 $('ramp').onchange = () => { S.loop.ramp = $('ramp').checked; save(); };
 $('rampN').oninput = () => { const v = +$('rampN').value; if (v >= 1) { S.loop.rampN = v; save(); } };
-document.querySelectorAll('.bpb').forEach(b => b.onclick = () => { S.bpb = +b.dataset.n; S.bpbManual = true; autoPhase(); markBpb(); renderBeats(); lastLit = -1; save(); renderMode(); renderLoop(); });
+// 拍子ボタン: 区間が複数ある曲では「今いる区間」だけ変える(空奏列車のように途中で拍子が変わる曲を手でも直せる)。1区間なら曲全体
+document.querySelectorAll('.bpb').forEach(b => b.onclick = () => {
+  const n = +b.dataset.n;
+  if (hasBeats() && S.segStarts.length > 1) {
+    const s = curSeg();
+    if (!S.meters) { S.meters = S.segStarts.map(() => S.bpb); S.meterManual = S.segStarts.map(() => false); S.savedSegStarts = S.segStarts.slice(); }
+    S.meters[s] = n; S.meterManual[s] = true; S.phaseManual[s] = false;
+    setStatus('区間 ' + (s + 1) + '(' + fmt(S.beats[S.segStarts[s]]) + '〜)を ' + n + '拍子にしました。他の区間はそのまま。');
+  } else { S.bpb = n; S.bpbManual = true; }
+  autoPhase(); markBpb(); renderBeats(); lastLit = -1; save(); renderMode(); renderLoop();
+});
 function nudge(ms) {
   if (hasBeats()) { S.shift = Math.round((S.shift + ms / 1000) * 1000) / 1000; }
   else { S.offset += ms / 1000; $('offset').value = S.offset.toFixed(3); }

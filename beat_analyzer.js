@@ -481,7 +481,7 @@
     const decisive = (f, m) => { const sums = []; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < f.length; i += m) { s += f[i]; c++; } sums.push(c ? s / c : 0); } const mean = sums.reduce((a, b) => a + b, 0) / m; return mean > 0 ? Math.max(0.02, (Math.max(...sums) - mean) / mean) : 0.02; };
     const peakOf = (f, m) => { const n = f.length; if (n < 24) return 0; const mean = f.reduce((a, b) => a + b, 0) / n; const sd = Math.sqrt(f.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n) || 1; let best = -Infinity; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < n; i += m) { s += f[i]; c++; } best = Math.max(best, (s / c - mean) / sd); } return best; };
     const buildStrength = (m) => {
-      const nA = m === 3 ? novFold(3) : oNov2, nB = m === 3 ? novFold(6) : oNov;
+      const nA = m % 3 === 0 ? novFold(3) : oNov2, nB = m % 3 === 0 ? novFold(6) : oNov;   // 6拍子も 3拍幅・6拍幅
       const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), nA.map(v => v / Math.max(...nA, 1e-9)), nB.map(v => v / Math.max(...nB, 1e-9))];
       const wts = feats.map(f => Math.pow(decisive(f, m), 2));   // 2乗で、はっきり分ける特徴を強く
       const wsum = wts.reduce((a, b) => a + b, 0);
@@ -499,6 +499,56 @@
     const strength = chosen.strength, wts = chosen.wts;
     log(`小節頭の特徴の重み(${meter}拍子): 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 短い幅の和音 ${wts[2].toFixed(3)} 長い幅の和音 ${wts[3].toFixed(3)}`);
     log(`拍子: 3拍子の突出 ${s3.peak.toFixed(2)} / 4拍子の突出 ${s4.peak.toFixed(2)}${s2 ? ` / 2拍子の突出 ${s2.peak.toFixed(2)}` : ''} → ${meter}`);
+    // 曲の途中で拍子が変わる曲(空奏列車: 6拍子の区間と4拍子の区間がある)。48拍の窓を12拍ずつ進め、3・4・6拍周期の突出を
+    // 「窓の中で拍の強さを入れ替えた(並べ替え)ときの突出」と比べた z 値で測る(素の突出は周期が長いほど標本が減って高く出るので、そのままでは比べられない)。
+    // 今の拍子より z が 1.5 以上高い周期が 2 窓続いたら拍子の変化。境界は前の区間の小節線に揃える。2拍子(6/8 を2つ振り)の曲では見ない
+    const meterRegions = [{ start: 0, meter }];
+    if (meter !== 2 && beats.length >= 96) {
+      const sFor = { 3: s3.strength, 4: s4.strength, 6: buildStrength(6).strength };
+      const W = 48, ST = 12, ms = [3, 4, 6];
+      let seed = 12345; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+      const zOf = (f, m) => {
+        const raw = peakOf(f, m); const arr = f.slice(); const nulls = [];
+        for (let k = 0; k < 24; k++) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; } nulls.push(peakOf(arr, m)); }
+        const mu = nulls.reduce((a, b) => a + b, 0) / nulls.length, sd = Math.sqrt(nulls.reduce((a, b) => a + (b - mu) * (b - mu), 0) / nulls.length) || 1e-6;
+        return (raw - mu) / sd;
+      };
+      const wins = [];
+      for (let i = 0; i + W <= beats.length; i += ST) { const z = {}; for (const m of ms) z[m] = zOf(sFor[m].slice(i, i + W), m); wins.push({ i, z }); }
+      let cur = meter, pending = null;
+      for (const w of wins) {
+        const best = ms.reduce((a, m) => w.z[m] > w.z[a] ? m : a, ms[0]);
+        const strong = best !== cur && w.z[best] > w.z[cur] + 2 && w.z[best] > 3.5;   // 一定拍子の実曲で 2.8〜3.6 の山が 2 窓だけ出て 4→6 に化けたので、3.5 以上を 3 窓
+        if (opts.debugWins) log(`拍子窓 ${beats[w.i].toFixed(1)}s: z3=${w.z[3].toFixed(1)} z4=${w.z[4].toFixed(1)} z6=${w.z[6].toFixed(1)} 今 ${cur}${strong ? ' → ' + best + ' 候補' : ''}`);
+        if (strong && pending && pending.m === best && ++pending.n >= 3) {
+          // 前の区間の小節線に揃える(前の区間の強さで最も強い位相 = 小節頭)
+          const prev = meterRegions[meterRegions.length - 1]; const f = sFor[prev.meter];
+          let bestPh = 0, bestV = -Infinity; for (let ph = 0; ph < prev.meter; ph++) { let v = 0, c = 0; for (let k = prev.start + ph; k < pending.i; k += prev.meter) { v += f[k]; c++; } v = c ? v / c : 0; if (v > bestV) { bestV = v; bestPh = ph; } }
+          // 境目の位置: 最初に変化が見えた窓の中(±1窓)で、前の区間の小節線に乗る位置を1つずつ試し、
+          // 「境目の前 W 拍が前の拍子で」「後ろ W 拍が新しい拍子で」最もはっきりする位置にする(窓の頭のままだと最大で半窓ぶん早く出た)
+          let start = pending.i, bestS = -Infinity;
+          const fNew = sFor[best];
+          for (let c = Math.max(prev.start + prev.meter * 2, pending.i - W / 2); c <= Math.min(beats.length - W, pending.i + W); c++) {
+            if (((c - prev.start - bestPh) % prev.meter + prev.meter) % prev.meter !== 0) continue;
+            const sc = peakOf(f.slice(Math.max(prev.start, c - W), c), prev.meter) + peakOf(fNew.slice(c, c + W), best);
+            if (sc > bestS) { bestS = sc; start = c; }
+          }
+          if (start > prev.start + prev.meter * 2) { meterRegions.push({ start, meter: best }); cur = best; }
+          pending = null;
+        } else if (!(strong && pending && pending.m === best)) pending = strong ? { m: best, i: w.i, n: 1 } : null;
+      }
+      // 12小節未満の区間は前に吸収
+      for (let i = 1; i < meterRegions.length; ) { const r = meterRegions[i], nx = meterRegions[i + 1]; const len = (nx ? nx.start : beats.length) - r.start; if (len < r.meter * 12) { meterRegions.splice(i, 1); if (nx && nx.meter === meterRegions[i - 1].meter) meterRegions.splice(i, 1); } else i++; }
+      if (meterRegions.length > 1) log(`拍子の区間: ${meterRegions.map(r => `${beats[r.start].toFixed(1)}s ${r.meter}拍子`).join(', ')}`);
+    }
+    // 拍子の区間の境目でテンポ区間を割る(画面は区間ごとに拍子と1拍目を持つ)
+    for (const r of meterRegions.slice(1)) {
+      const near = segStarts.find(v => Math.abs(v - r.start) <= r.meter * 2);   // テンポ区間の境目の近く(2小節)なら、そこに揃える
+      if (near !== undefined) { r.start = near; continue; }
+      let k = 0; while (k + 1 < segStarts.length && segStarts[k + 1] <= r.start) k++;
+      segStarts.splice(k + 1, 0, r.start); tempi.splice(k + 1, 0, { start: Math.round(beats[r.start] * 100) / 100, bpm: tempi[k].bpm });
+    }
+    for (let k = 0; k < segStarts.length; k++) { let m = meterRegions[0].meter; for (const r of meterRegions) if (r.start <= segStarts[k]) m = r.meter; tempi[k].meter = m; }
     const features = opts.features ? { rise: oAll.map(v => v / mA), low: oLow.map(v => v / mL), chg: oChg.map(v => v / mC), nov: oNov.map(v => v / mN), nov2: oNov2, nov8: oNov8, nov16: oNov16 } : undefined;
 
     return {
