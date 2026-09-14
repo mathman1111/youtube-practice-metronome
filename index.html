@@ -767,6 +767,10 @@ async function analyzeCaptured(cap, csr, beepAt) {
   // AudioContext の時刻 → 動画の時刻。再生中に 100ms ごとに集めた組を区分線形でつなぐ(途中で止まっても、そこだけ正しく対応する)
   const pairs = cap.pairs.filter(p => p[1] > 0.2).sort((a, b) => a[0] - b[0]);
   if (pairs.length < 10) throw new Error('動画が再生されませんでした');
+  // 録音の長さが再生時間に対して短すぎたら、解析せずにやり直してもらう(2026-09-14 の検査で、171秒の再生に対し 122秒しか
+  // 録れていないのに欠落として数えられず、127.87BPM という別の曲のような結果になった。タブ音声の取り込みが途中で止まったらしい)
+  const played = pairs[pairs.length - 1][1] - pairs[0][1], recorded = total / csr - (pairs[0][0] - cap.firstPlaybackTime);
+  if (recorded < played * 0.9) throw new Error('録音が途中で途切れました(再生 ' + Math.round(played) + '秒に対し録音 ' + Math.round(recorded) + '秒)。タブの音声共有をやり直してもう一度録ってください');
   const ctxToVideoAt = (c) => {
     if (c <= pairs[0][0]) return pairs[0][1] - (pairs[0][0] - c);
     if (c >= pairs[pairs.length - 1][0]) return pairs[pairs.length - 1][1] + (c - pairs[pairs.length - 1][0]);
