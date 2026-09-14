@@ -89,6 +89,7 @@
         <button class="small" id="half">拍を半分に(÷2)</button>
         <button class="small" id="double">拍を倍に(×2)</button>
         <button class="small" id="manual">手動に戻す</button>
+        <button class="small" id="splitHere" title="今いる小節の頭で区間を切る。そのあと 2/3/4/6 を押すと、その区間だけ拍子が変わる(空奏列車のイントロが6拍子、など)">ここから拍子を変える(区切る)</button>
       </div>
       <div class="row" id="analyzeHint"><span style="color:var(--dim);font-size:12px">動画の音声を落として拍を検出する(20〜60秒)。1拍目の位置は自動推定。違っていたら曲の1拍目で D を押すと直る</span></div>
       <div class="sep"></div>
@@ -811,7 +812,7 @@ async function fetchBeats(id) {
     if (!r) r = await fetch(BEATS_DIR + '/' + id + '.json?t=' + Date.now(), { cache: 'no-store' });   // GitHub Pages のCDNキャッシュを避ける
     if (!r.ok) return false;
     const d = await r.json();
-    if (hasBeats() && d.generated && S.generated && d.generated <= S.generated) return true;   // 保存済みのほうが新しい(または同じ)ならそのまま
+    if (hasBeats() && d.generated && S.generated && d.generated <= S.generated) return true;   // 保存済みのほうが新しい(または同じ)ならそのまま(手で切った区間・拍子も残る)
     applyBeats(d);
     setStatus('解析済みの拍を読み込みました(' + S.bpm + ' BPM)。再生してください。');
     return true;
@@ -931,6 +932,23 @@ $('loopClear').onclick = () => { S.loop.on = false; S.loop.from = S.loop.to = nu
 $('preroll').onchange = () => { S.loop.preroll = $('preroll').checked; renderLoop(); save(); };
 $('ramp').onchange = () => { S.loop.ramp = $('ramp').checked; save(); };
 $('rampN').oninput = () => { const v = +$('rampN').value; if (v >= 1) { S.loop.rampN = v; save(); } };
+// 今いる小節の頭で区間を切る(解析が拍子の変化を見つけられない曲を手で直すため。空奏列車のイントロ 0:03〜0:18 は 6拍子だが、
+// 全拍に8分音符が乗っていて 6 拍ごとの休符だけが手がかりなので、拍の強さからは検出できなかった)
+function splitHere() {
+  if (!hasBeats()) { setStatus('解析した拍がある曲でだけ使えます。', true); return; }
+  const k = Math.max(0, beatIndex(ready ? videoTime() : 0)), s = segIndex(k);
+  const kb = k - mod(k - S.segStarts[s] - (S.phases[s] || 0), bpbOf(s));   // 今いる小節の頭
+  if (kb <= S.segStarts[s] || kb >= S.beats.length - 1) { setStatus('この小節は区間の頭なので、ここでは切れません。次の小節で押してください。', true); return; }
+  if (!S.meters) { S.meters = S.segStarts.map(() => S.bpb); S.meterManual = S.segStarts.map(() => false); }
+  S.segStarts.splice(s + 1, 0, kb);
+  S.phases.splice(s + 1, 0, 0); S.phaseManual.splice(s + 1, 0, true);   // 小節の頭で切ったので位相 0 を固定
+  S.meters.splice(s + 1, 0, S.meters[s]); S.meterManual.splice(s + 1, 0, true);
+  if (S.tempi) S.tempi.splice(s + 1, 0, { start: Math.round(S.beats[kb] * 100) / 100, bpm: S.tempi[s].bpm, meter: S.meters[s], manual: true });
+  S.savedSegStarts = S.segStarts.slice();
+  lastScheduled = null; lastLit = -1; save(); renderMode(); renderLoop(); markBpb();
+  setStatus(fmt(S.beats[kb]) + ' で区間を切りました(区間 ' + (s + 2) + ')。ここから先の拍子を 2/3/4/6 で選んでください。');
+}
+$('splitHere').onclick = splitHere;
 // 拍子ボタン: 区間が複数ある曲では「今いる区間」だけ変える(空奏列車のように途中で拍子が変わる曲を手でも直せる)。1区間なら曲全体
 document.querySelectorAll('.bpb').forEach(b => b.onclick = () => {
   const n = +b.dataset.n;
