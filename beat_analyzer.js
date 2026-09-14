@@ -164,6 +164,16 @@
       for (; t < b; t += per) { s += envAt(onset, t); n++; }
       return n ? s / n : 0;
     }
+    // 拍上の強さの幾何平均(対数平均)。2/3 や 3/2 の格子は半分〜2/3 の点が裏拍(弱い)に乗るので、算術平均より大きく下がる。
+    // 真の拍の格子は全点が拍に乗るので算術平均に近い。ゼロ対策に包絡の平均の 5% を足す
+    let onsetMean = 0; for (let i = 0; i < onset.length; i++) onsetMean += onset[i]; onsetMean /= onset.length || 1;
+    function gridScoreGeo(bpm, off, a, b) {
+      a = a || 0; b = b === undefined ? T : b;
+      const per = 60 / bpm, eps = onsetMean * 0.05; let s = 0, n = 0;
+      let t = off; if (t < a) t += Math.ceil((a - t) / per) * per;
+      for (; t < b; t += per) { s += Math.log(envAt(onset, t) + eps); n++; }   // 低域は足さない(3-3-2 のベースが付点の格子に乗り、2/3 の候補を押し上げた)
+      return n ? Math.exp(s / n) - eps : 0;
+    }
     // bpm0 の±pct% で BPM と位相を総当たりで詰める(粗→細)。範囲 [a,b) に限定できる
     function refine(bpm0, a, b, pct) {
       a = a || 0; b = b === undefined ? T : b; pct = pct || 0.03;
@@ -213,14 +223,24 @@
         const half = gridScore(bpm, off + 30 / bpm, a, b);
         const contrast = sc - half;
         const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / priorCenter) / priorWidth, 2));
-        results.push({ score: contrast * prior * acAt(ac, bpm), contrast, bpm, off });
+        // 評価は「拍上の強さ」(sc)そのもの。コントラスト(拍上−半拍)で選ぶと、8分音符が刻まれる速い曲で 2/3 の候補が勝つ
+        // (180BPM の曲: 120 の格子は拍と裏の8分に交互に乗り、その半拍先=16分は弱いのでコントラストが大きい。
+        //  一方 180 の格子は半拍先が裏の8分で強く、コントラストが小さい)。無作為の実曲10曲で 2 曲がこれで 2/3 になった。
+        // 拍上の強さなら 2/3 の候補は半分が裏拍に乗るぶん必ず低くなる。半分/倍の候補は同じくらいになるので、それは下の規則で決める
+        const geo = gridScoreGeo(bpm, off, a, b);
+        // 1/3周期ずらしの対称性: 2/3(や 4/3)の候補の格子は「拍と裏の8分に交互に乗る」ので、1/3周期(=半拍)ずらしても同じ強さになる。
+        // 本当の拍の格子を1/3拍ずらすと16分・3連の位置で弱い。この対称性が高い候補は拍の階層の取り違え
+        const sym = Math.max(gridScore(bpm, off + 20 / bpm, a, b), gridScore(bpm, off - 20 / bpm, a, b)) / (sc || 1);
+        // 実曲では 2/3・4/3 の候補が 0.9〜1.0、本当の拍(と半分・倍)が 0.25〜0.7 に分かれたので、0.82 付近で急に落とす
+        const symPenalty = 1 / (1 + Math.exp((sym - 0.88) / 0.04));
+        results.push({ score: geo * prior * Math.pow(acAt(ac, bpm), 0.3) * symPenalty, on: sc, geo, sym, contrast, bpm, off });   // 自己相関は弱く効かせる(1乗だと 145BPM の曲で 2/3 の 96.65 が勝った。候補は自己相関の山から出しているので、ここで強く効かせる必要はない)
       }
       // 付点(1.5倍・2.5倍…)の周期のピークが他にあるなら、その候補が本当の拍で、他は拍の上の強弱パターン。
       // 空奏列車(175BPM)で 2/3 の 116.6 が「コントラスト」で勝っていたので、半整数比で説明できる候補を強く優先する
       for (const r of results) {
         let ev = 0;
         for (const o of results) { const ratio = (60 / o.bpm) / (60 / r.bpm); if (ratio > 1.2 && Math.abs(ratio - Math.round(ratio - 0.5) - 0.5) < 0.04) ev++; }
-        r.evidence = ev; r.score *= 1 + 2 * ev;
+        r.evidence = ev; r.score *= 1 + 0 * ev;
       }
       results.sort((x, y) => y.score - x.score);
       let top = results[0];
@@ -237,8 +257,28 @@
     const { out: cands, add } = acPeaks(acG, 6);
     for (const c of cands.slice(0, 4)) { add(c * 2); add(c / 2); }
     if (!cands.length) cands.push(120);
-    const g = chooseTempo(cands, 0, T, acG, 120, 0.8, 0.03);
-    for (const r of g.results) log(`候補 ${r.bpm.toFixed(2)} BPM コントラスト ${r.contrast.toFixed(2)} 付点の根拠 ${r.evidence} 評価 ${r.score.toFixed(3)}`);
+    const g = chooseTempo(cands, 0, T, acG, 120, 1.2, 0.03);
+    for (const r of g.results) log(`候補 ${r.bpm.toFixed(2)} BPM 拍上 ${r.on.toFixed(2)} 幾何 ${r.geo.toFixed(2)} 対称 ${r.sym.toFixed(2)} コントラスト ${r.contrast.toFixed(2)} 付点の根拠 ${r.evidence} 評価 ${r.score.toFixed(3)}`);
+    // 複合拍子(6/8・速い3拍子)の検出。選んだ拍 P の 1.5 倍の候補が「取り違えでない格子」(対称性 < 0.6)として立っていれば、
+    // P は 3 つに割れる拍(6/8 の付点4分、または速い 3/4 の小節)。3P が範囲内に立っていれば 3P を4分音符・3拍子に(命ノゼンマイ 66→198)、
+    // 立っていなければ P のまま 2拍子(6/8 を 2 つ振り: 蒼のワルツ 82.67、瞳の奥をのぞかせて 76.67)。
+    // P は選んだ拍そのものと、その半分(6/8 の付点8分の格子=2倍が勝つことがある: 棒人間 154→77)の両方を見る
+    let meterHint = 0;
+    {
+      const find = (bpm, tol) => g.results.find(r => Math.abs(r.bpm / bpm - 1) < tol);
+      for (const P of [g.top.bpm, g.top.bpm / 2]) {
+        const pr = find(P, 0.03);
+        if (!pr || pr.sym >= 0.85 || P < 55) continue;
+        const c15 = find(P * 1.5, 0.04);
+        if (!(c15 && c15.sym < 0.6 && c15.geo >= pr.geo * 0.6)) continue;
+        const c3 = find(P * 3, 0.04);
+        // 3P が 4分音符(速い 3/4)か 8分音符(遅い 6/8)かは、3P の格子の強さで分ける。速い 3/4 は毎拍に音があるので P の 7 割以上
+        // (命ノゼンマイ 66→198: 0.80)、遅い 6/8 の 8分は軽い(ロマンスをこえよう 67 の 201: 0.61)
+        if (c3 && c3.sym < 0.6 && P * 3 <= 220 && c3.geo >= pr.geo * 0.7) { g.top = c3; meterHint = 3; log(`複合拍子: 拍 ${pr.bpm.toFixed(1)} が3つに割れる(1.5倍 ${c15.bpm.toFixed(1)} 対称 ${c15.sym.toFixed(2)})→ 4分音符 ${c3.bpm.toFixed(1)} の3拍子`); }
+        else { g.top = pr; meterHint = 2; log(`複合拍子: 拍 ${pr.bpm.toFixed(1)} が3つに割れる(1.5倍 ${c15.bpm.toFixed(1)} 対称 ${c15.sym.toFixed(2)})→ 6/8 を2つ振り`); }
+        break;
+      }
+    }
     const gBpm = g.top.bpm;
 
     // 2. 途中でテンポが変わる曲: 12秒窓(4秒刻み)ごとの局所テンポを測り、2%以上違う区間に分ける
@@ -256,11 +296,33 @@
         // 半分・2/3・3/4 など単純な比の候補は拍の階層の取り違えなので変化と数えない(一定テンポの曲の静かな所で 83 や 110 が出た)
         const gr = refine(gBpm, a, b, 0.015);
         const gContrast = gr[0] - gridScore(gr[1], gr[2] + 30 / gr[1], a, b);
-        const ratio = r.top.bpm / gBpm;
-        const simple = [0.5, 2, 2 / 3, 1.5, 0.75, 4 / 3, 1 / 3, 3].some(q => Math.abs(ratio / q - 1) < 0.04);   // 局所推定は3%程度ずれる(付点8分の区間で 137 が 141 と出た)ので 4% まで同一視
-        const changed = !simple && Math.abs(ratio - 1) > 0.06 && r.top.contrast > gContrast * 1.6 && r.top.contrast > 0.05;   // 6%未満の変化・ゆるやかな変化は追従(トラッカー)が吸収する
-        wins.push({ a, b, bpm: changed ? r.top.bpm : gr[1], contrast: r.top.contrast, changed });
-        if (opts.debugWins) { const perG = 60 / gBpm; const ph = (((gr[2] - g.top.off) % perG) + perG) % perG; log(`窓 ${a}s: 局所 ${r.top.bpm.toFixed(1)} c=${r.top.contrast.toFixed(2)} 全体グリッド ${gr[1].toFixed(2)} c=${gContrast.toFixed(2)} 位相 ${(ph * 1000).toFixed(0)}ms ${changed ? '変化' : ''}`); }
+        const gGeo = gridScoreGeo(gr[1], gr[2], a, b);
+        const gSym = Math.max(gridScore(gr[1], gr[2] + 20 / gr[1], a, b), gridScore(gr[1], gr[2] - 20 / gr[1], a, b)) / (gr[0] || 1);
+        // 半分・倍・1/3・3倍は拍の階層の取り違えなので変化と数えない。
+        // 2/3・3/2・3/4・4/3 は以前は全部落としていた(一定テンポの曲の静かな所で 83/110/127 が出た)が、133→196 のような 3:2 の
+        // 本当の変化も落としていたので、局所候補の「1/3周期ずらしの対称性」が低い(=取り違えでない)ときだけ変化として認める。
+        // 判定は「拍上の強さの幾何平均」で比べる(コントラストだと 196BPM の区間で裏の8分が強くて負けた)。6%未満の変化・ゆるやかな変化は追従(トラッカー)が吸収する。
+        // 単純な比の変化は、全体グリッドがこの窓で対称(=拍と裏に交互に乗っている)か、局所候補が 1.6 倍以上はっきり勝つときだけ。
+        // 133→196 の 3:2 は全体グリッドの対称性 0.8〜0.99 で見つかり、135BPM の曲の 3対4 のポリリズム区間(101BPM の格子が 1.4 倍勝つ)は落とす。
+        // 対称性の上限は 0.85(70BPM の曲は3連の裏が乗るので本当の拍でも 0.7〜0.8 になる。2/3 の取り違えは 0.9 以上)
+        const notMixup = r.top.sym < 0.85;
+        const better = r.top.geo > gGeo * 1.25 && notMixup;
+        const symEvidence = gSym > 0.8 && notMixup && r.top.geo >= gGeo * 0.9;
+        // 局所候補が半分・倍で出ることがある(196BPM の区間が 98 と出る)ので、そのまま・倍・半分の順に全体テンポとの比を見る
+        let changed = false, bpmW = gr[1];
+        for (const q of [1, 2, 0.5]) {
+          const bpmQ = r.top.bpm * q, ratio = bpmQ / gBpm;
+          if (bpmQ < 60 || bpmQ > 220) continue;
+          const octave = [0.5, 2, 1 / 3, 3].some(k => Math.abs(ratio / k - 1) < 0.04);   // 局所推定は3%程度ずれる(付点8分の区間で 137 が 141 と出た)ので 4% まで同一視
+          const simple = [2 / 3, 1.5, 0.75, 4 / 3].some(k => Math.abs(ratio / k - 1) < 0.04);
+          // 遅くなる側の単純な比(2/3・3/4)は対称性の根拠では認めない: 一定テンポの曲の「3対4」のアルペジオ区間(145BPM の曲の 110、135 の 101)が
+          // 全体グリッドを対称に見せる。速くなる側(3/2・4/3: 133→196、イントロ 180→134 の逆)は対称性の根拠でよい
+          const ok = !octave && Math.abs(ratio - 1) > 0.06 && r.top.contrast > 0.05 && (simple ? ((ratio > 1 && symEvidence) || (r.top.geo > gGeo * 1.6 && notMixup)) : (better || symEvidence));
+          if (ok) { changed = true; bpmW = bpmQ; break; }
+          if (q === 1 && Math.abs(ratio - 1) <= 0.06) break;   // 全体テンポと同じなら倍・半分は見ない
+        }
+        wins.push({ a, b, bpm: bpmW, contrast: r.top.contrast, changed });
+        if (opts.debugWins) { const perG = 60 / gBpm; const ph = (((gr[2] - g.top.off) % perG) + perG) % perG; log(`窓 ${a}s: 局所 ${r.top.bpm.toFixed(1)} c=${r.top.contrast.toFixed(2)} geo=${r.top.geo.toFixed(2)} sym=${r.top.sym.toFixed(2)} 全体グリッド ${gr[1].toFixed(2)} c=${gContrast.toFixed(2)} geo=${gGeo.toFixed(2)} sym=${gSym.toFixed(2)} 位相 ${(ph * 1000).toFixed(0)}ms ${changed ? '変化 ' + bpmW.toFixed(1) : ''}`); }
       }
       // 「変化」と判定された窓が、テンポの近い(2%以内)まま 3窓以上(12秒以上)続いたときだけ別区間にする。
       // 1〜2窓だけの変化はフィルや静かな所での取り違え(一定テンポの曲で 99〜108秒に 127BPM が出た)
@@ -268,13 +330,16 @@
       for (let i = 0; i < wins.length; i++) {
         const w = wins[i];
         const g0 = groups[groups.length - 1];
-        if (w.changed && g0 && g0.open && Math.abs(w.bpm / g0.bpm - 1) < 0.02) { g0.j = i; g0.sum += w.bpm; g0.n++; g0.bpm = g0.sum / g0.n; }
+        // 倍・半分で出た窓は同じテンポの窓として数える(74→84 の曲で、74 の区間の途中に 149 の窓が2つ入り、区間が 66 秒で切れた)
+        const oct = g0 && g0.open ? [1, 2, 0.5].find(q => Math.abs(w.bpm / q / g0.bpm - 1) < 0.02) : undefined;
+        if (w.changed && oct) { w.bpm /= oct; g0.j = i; g0.sum += w.bpm; g0.n++; g0.bpm = g0.sum / g0.n; }
         else if (w.changed) { if (g0) g0.open = false; groups.push({ i, j: i, bpm: w.bpm, sum: w.bpm, n: 1, open: true }); }
         else if (g0) g0.open = false;
       }
       let cursor = 0;
       for (const gr of groups.filter(x => x.n >= 3)) {
-        const a = wins[gr.i].a + (W - STEP) / 2, b = wins[gr.j].a + W - (W - STEP) / 2;
+        // 曲の頭 8 秒以内から始まる変化区間は 0 秒からにする(静かなイントロの最初の窓は判定が付かないが、そこだけ別テンポということはまず無い)
+        const a = gr.i <= 2 ? 0 : wins[gr.i].a + (W - STEP) / 2, b = wins[gr.j].a + W - (W - STEP) / 2;
         if (a - cursor >= 8) segments.push({ a: cursor, b: a, bpm0: gBpm });
         else if (segments.length) segments[segments.length - 1].b = a; else { /* 先頭が変化区間 */ }
         segments.push({ a: segments.length ? a : 0, b, bpm0: gr.bpm });
@@ -354,8 +419,18 @@
       }
       p.b = q.a = best[1];
     } };
+    // 4c. 境界を動かした結果 8 秒未満になった区間は隣(テンポの近いほう)に吸収する(7.5 秒や 4 秒の区間が実曲で出た)
+    const dropShort = () => { for (let i = 0; i < segments.length && segments.length > 1; ) {
+      const sg = segments[i];
+      if (sg.b - sg.a >= 8) { i++; continue; }
+      const p = segments[i - 1], q = segments[i + 1];
+      const toPrev = p && (!q || Math.abs(Math.log(p.bpm0 / sg.bpm0)) <= Math.abs(Math.log(q.bpm0 / sg.bpm0)));
+      if (toPrev) p.b = sg.b; else q.a = sg.a;
+      segments.splice(i, 1);
+    } };
+    const mergeSame = () => { for (let i = 1; i < segments.length; ) { const p = segments[i - 1], q = segments[i]; if (Math.abs(q.bpm0 / p.bpm0 - 1) < 0.02) { p.b = q.b; segments.splice(i, 1); } else i++; } };
     fitSegments();
-    if (segments.length > 1) { refineBoundaries(); fitSegments(); refineBoundaries(); }
+    if (segments.length > 1) { refineBoundaries(); dropShort(); mergeSame(); fitSegments(); refineBoundaries(); dropShort(); mergeSame(); fitSegments(); }
     for (const sg of segments) {
       segStarts.push(beats.length);
       for (const v of sg.grid) if (v >= sg.a && v < sg.b) beats.push(v);
@@ -398,31 +473,32 @@
     const perOf = (i) => (i + 1 < beats.length ? beats[i + 1] - beats[i] : (i > 0 ? beats[i] - beats[i - 1] : 0.5));
     const novFold = (w) => beats.map((t, i) => { const per = perOf(i); return novAt(t, w * per) + novAt(t - per / 2, w * per); });
     const oNov2 = novFold(2), oNov = novFold(4), oNov8 = novW(8), oNov16 = novW(16);
-    const mN = Math.max(...oNov, 1e-9);
+    const mN = Math.max(...oNov, 1e-9), mN2 = Math.max(...oNov2, 1e-9);
     // 4つの特徴を、それぞれが「どれだけ位相をはっきり分けるか」(最も強い位相の平均からの突出)で重み付けして合成する。
-    // 空奏列車は音量系がほぼ平ら(26/24/26/25)で和音系が 1拍目を指していたのに、固定の重みで音量系に引かれて1拍ずれた
-    const mN2 = Math.max(...oNov2, 1e-9);
-    // 1拍単位の和音変化(oChg)は先取りで1拍前に付くので合成には使わない(空奏列車で1拍前を指した)
-    const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), oNov2.map(v => v / mN2), oNov.map(v => v / mN)];
+    // 空奏列車は音量系がほぼ平ら(26/24/26/25)で和音系が 1拍目を指していたのに、固定の重みで音量系に引かれて1拍ずれた。
+    // 1拍単位の和音変化(oChg)は先取りで1拍前に付くので合成には使わない(空奏列車で1拍前を指した)。
+    // 和音の幅は拍子ごとに変える(4拍子: 2拍幅・4拍幅、3拍子: 3拍幅・6拍幅)。4拍幅のまま3拍子を判定すると小節と合わずに 3 が出なかった
     const decisive = (f, m) => { const sums = []; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < f.length; i += m) { s += f[i]; c++; } sums.push(c ? s / c : 0); } const mean = sums.reduce((a, b) => a + b, 0) / m; return mean > 0 ? Math.max(0.02, (Math.max(...sums) - mean) / mean) : 0.02; };
-    const wts = feats.map(f => Math.pow(decisive(f, 4), 2));   // 2乗で、はっきり分ける特徴を強く
-    const wsum = wts.reduce((a, b) => a + b, 0);
-    log(`小節頭の特徴の重み: 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 2拍幅の和音 ${wts[2].toFixed(3)} 4拍幅の和音 ${wts[3].toFixed(3)}`);
-    const strength = beats.map((_, i) => Math.round(feats.reduce((acc, f, k) => acc + wts[k] / wsum * f[i], 0) * 1e4) / 1e4);
-    // 拍子の推定(3拍子 か 4拍子 か)。拍ごとの強さを m 拍周期で重ねたとき、最も強い位相がどれだけ突出するかで比べる。
+    const peakOf = (f, m) => { const n = f.length; if (n < 24) return 0; const mean = f.reduce((a, b) => a + b, 0) / n; const sd = Math.sqrt(f.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n) || 1; let best = -Infinity; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < n; i += m) { s += f[i]; c++; } best = Math.max(best, (s / c - mean) / sd); } return best; };
+    const buildStrength = (m) => {
+      const nA = m === 3 ? novFold(3) : oNov2, nB = m === 3 ? novFold(6) : oNov;
+      const feats = [oAll.map(v => v / mA), oLow.map(v => v / mL), nA.map(v => v / Math.max(...nA, 1e-9)), nB.map(v => v / Math.max(...nB, 1e-9))];
+      const wts = feats.map(f => Math.pow(decisive(f, m), 2));   // 2乗で、はっきり分ける特徴を強く
+      const wsum = wts.reduce((a, b) => a + b, 0);
+      const strength = beats.map((_, i) => Math.round(feats.reduce((acc, f, k) => acc + wts[k] / wsum * f[i], 0) * 1e4) / 1e4);
+      return { m, wts, strength, peak: peakOf(strength, m) };
+    };
+    // 拍子の推定(3拍子 か 4拍子 か)。拍子ごとに合成した強さを m 拍周期で重ねたとき、最も強い位相がどれだけ突出するかで比べる。
     // 2拍子と4拍子は音からは区別できない(4/4 は 2/4 を2つ並べたもの)ので、2 は手動
-    let meter = 4;
-    {
-      const f = strength, n = f.length;
-      if (n >= 24) {
-        const mean = f.reduce((a, b) => a + b, 0) / n;
-        const sd = Math.sqrt(f.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n) || 1;
-        const peak = (m) => { let best = -Infinity; for (let p = 0; p < m; p++) { let s = 0, c = 0; for (let i = p; i < n; i += m) { s += f[i]; c++; } best = Math.max(best, (s / c - mean) / sd); } return best; };
-        const p3 = peak(3), p4 = peak(4);
-        meter = p3 > p4 * 1.3 && p3 > 0.15 ? 3 : 4;
-        log(`拍子: 3拍子の突出 ${p3.toFixed(2)} / 4拍子の突出 ${p4.toFixed(2)} → ${meter}`);
-      }
-    }
+    const s3 = buildStrength(3), s4 = buildStrength(4);
+    // 3つに割れる拍(6/8 か 12/8)は、拍の強さの 4拍周期の突出が 2拍周期より 1.3 倍以上はっきりしていれば 12/8(=4拍子)、そうでなければ 6/8(=2拍子)。
+    // 叶わない(97)・亡国のネメシス(70)・マリオネット・バレリーナ(74.5)は 4 で、蒼のワルツ・棒人間・瞳の奥をのぞかせて は 2 になった
+    const s2 = meterHint === 2 ? buildStrength(2) : null;
+    let meter = meterHint === 2 ? (s4.peak > s2.peak * 1.3 ? 4 : 2) : (meterHint === 3 || (s3.peak > s4.peak * 1.3 && s3.peak > 0.15)) ? 3 : 4;
+    const chosen = meter === 3 ? s3 : meter === 2 ? s2 : s4;
+    const strength = chosen.strength, wts = chosen.wts;
+    log(`小節頭の特徴の重み(${meter}拍子): 音量 ${wts[0].toFixed(3)} 低域 ${wts[1].toFixed(3)} 短い幅の和音 ${wts[2].toFixed(3)} 長い幅の和音 ${wts[3].toFixed(3)}`);
+    log(`拍子: 3拍子の突出 ${s3.peak.toFixed(2)} / 4拍子の突出 ${s4.peak.toFixed(2)}${s2 ? ` / 2拍子の突出 ${s2.peak.toFixed(2)}` : ''} → ${meter}`);
     const features = opts.features ? { rise: oAll.map(v => v / mA), low: oLow.map(v => v / mL), chg: oChg.map(v => v / mC), nov: oNov.map(v => v / mN), nov2: oNov2, nov8: oNov8, nov16: oNov16 } : undefined;
 
     return {
